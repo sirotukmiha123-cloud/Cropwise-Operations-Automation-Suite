@@ -1,0 +1,31 @@
+# Секрети — ніколи не комітити
+config.json
+
+# Локальний кеш довідників
+ref_drivers.json
+ref_machines.json
+ref_fields.json
+ref_work_types.json
+mapping_cache.txt
+nomenclature.json
+
+# Реальні робочі дані (логи сесій, звіти, Excel/Word-файли компанії)
+*_LOG.json
+звіт_пальне.txt
+звіт_списання.txt
+фінальний_звіт.txt
+*.xlsx
+*.xls
+*.docx
+!example*.xlsx
+!example*.docx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ОС
+.DS_Store
+Thumbs.db
