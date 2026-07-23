@@ -967,13 +967,26 @@ def run_mode_primary_import(session):
         parsed_range = parse_flexible_time(excel_time_val)
         if parsed_range:
             time_formatted = parsed_range
-            day_time_memory[date_val] = int(parsed_range.split("-")[1].split(":")[0])
+            end_h, end_m = map(int, parsed_range.split("-")[1].split(":"))
+            day_time_memory[date_val] = end_h * 60 + end_m
         else:
-            start_hour = day_time_memory.get(date_val, 8)
-            end_hour = int(start_hour + actual_hours)
-            if end_hour >= 24: end_hour = end_hour % 24
-            time_formatted = f"{start_hour:02d}:00-{end_hour:02d}:00"
-            day_time_memory[date_val] = end_hour
+            # ВАЖЛИВО: раніше тут було `end_hour = int(start_hour + actual_hours)`, що ОБРІЗАЛО
+            # дробову частину годин замість округлення. Для будь-якої операції коротшої за годину
+            # (напр. 0.28 год = 17 хв) це давало end_hour == start_hour (той самий час!), що потім
+            # хибно розпізнавалось як "перехід через північ" і додавало ЦІЛУ добу до дати
+            # завершення. Тепер рахуємо в хвилинах з округленням — короткі операції (хвилини)
+            # більше не перетворюються помилково на добові.
+            start_total_min = day_time_memory.get(date_val, 8 * 60)
+            duration_min = round(actual_hours * 60)
+            end_total_min = start_total_min + duration_min
+
+            start_h, start_m = divmod(start_total_min % (24 * 60), 60)
+            end_h, end_m = divmod(end_total_min % (24 * 60), 60)
+
+            time_formatted = f"{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}"
+            # Зберігаємо БЕЗ обрізання по модулю 24 год — щоб ланцюжок послідовних операцій
+            # того самого дня рахувався коректно, навіть якщо сумарно вони переходять за північ.
+            day_time_memory[date_val] = end_total_min
 
         if log_data.get(r_key, {}).get("status") == "sent":
             stats["skipped"] += 1
@@ -983,7 +996,7 @@ def run_mode_primary_import(session):
             continue
 
         prog_bar = draw_progress_bar(current_pos + 1, total_valid_count, width=20)
-        print(f"⚙️  [Робоча операція №{work_row_counter}] {prog_bar} | Відправка...: '{work_name[:30]}...'")
+        print(f"⚙️  [Робоча операція №{work_row_counter}] {prog_bar} | Сплавляю: '{work_name[:30]}...'")
 
         work_type_id = None
         for wt in work_types_data:
@@ -1363,8 +1376,8 @@ def print_final_report_mode2(log_path, stats, report_rows):
 # Списання (goods_issue) тепер прив'язується до вже наявної AgroOperation (яку Режим 1 створює
 # і зберігає agro_operation_id в лозі) через related_document_type='AgroOperation' — це єдиний
 # задокументований спосіб пов'язати складський документ з конкретною роботою.
-DEFAULT_WAREHOUSE_ID = 13       # ⚠️ Специфічно для акаунту автора! Змініть на ID вашого складу в Cropwise.
-DEFAULT_FUEL_WH_ITEM_ID = 171   # ⚠️ Специфічно для акаунту автора! Змініть на ID позиції "Пальне" з вашого довідника WhItem.
+DEFAULT_WAREHOUSE_ID = 13       # Склад, підтверджений користувачем
+DEFAULT_FUEL_WH_ITEM_ID = 171   # WhItem "Пальне", підтверджений користувачем
 
 def get_wh_item_unit_id(wh_item_id):
     """Дізнається базову одиницю виміру (unit_id) для WhItem — потрібна при створенні WhDocumentItem."""
@@ -1652,7 +1665,7 @@ def print_final_report_mode3(log_path, stats, report_rows):
 # =====================================================
 def main():
     print("=" * 70)
-    print("🚀 CROPWISE АВТОПІЛОТ — Версія v9.0 (Імпорт + Пальне + Списання) Soft")
+    print("🚀 CROPWISE АВТОПІЛОТ — Версія v9.0 (Імпорт + Пальне + Списання)")
     print("=" * 70)
 
     session = init_session()
