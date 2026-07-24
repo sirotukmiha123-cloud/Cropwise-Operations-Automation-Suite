@@ -38,7 +38,7 @@ def colorize_line(line):
 # =====================================================
 API_BASE = "https://operations.cropwise.com"
 
-CONFIG_EXAMPLE = '{\n  "cropwise_token": "ВАШ_ТОКЕН_ТУТ"\n}'
+CONFIG_EXAMPLE = '{\n  "cropwise_token": "Ваш токен тут"\n}'
 
 def load_cropwise_token():
     """
@@ -643,13 +643,24 @@ def format_iso_with_kyiv_offset(date_str, time_str_hms):
     offset_fmt = f"{offset_raw[:3]}:{offset_raw[3:]}"  # -> "+03:00"
     return f"{date_str}T{time_str_hms}.000{offset_fmt}"
 
+# Емпірично підтверджено сервером (422-помилка): технічне поле-заглушка "00 Інші не польові
+# операції (н.п.)" (ID 24) приймає площу не більше 0.1 га, НЕЗАЛЕЖНО від того, що показує наш
+# власний кеш fields_data (динамічний пошук tillable_area для цього поля виявився ненадійним —
+# можливо, поле в кеші має tillable_area=0 чи не заповнене, тоді як реальне обмеження на сервері
+# інше). Тому для відомих технічних полів застосовуємо гарантований резервний ліміт.
+KNOWN_STUB_FIELD_MAX_AREA = {24: 0.1, 25: 0.1}
+
 def get_field_tillable_area(field_id):
     """
-    Шукає реальну оброблювану площу (tillable_area) поля в уже завантаженому довіднику fields_data.
-    Потрібно, щоб коректно обмежувати planned_area/completed_area агрооперації для маленьких
-    технічних об'єктів (сміттєзвалище, бурт для гною тощо) — сервер відхиляє площу, що перевищує
-    tillable_area поля, а раніше це було захардкоджено лише для конкретних ID (24, 25).
+    Шукає реальну оброблювану площу (tillable_area) поля. Спершу перевіряє відомі технічні
+    поля-заглушки (гарантований ліміт, підтверджений сервером), інакше шукає в уже завантаженому
+    довіднику fields_data. Потрібно, щоб коректно обмежувати planned_area/completed_area
+    агрооперації для маленьких технічних об'єктів (сміттєзвалище, бурт для гною тощо) — сервер
+    відхиляє площу, що перевищує tillable_area поля.
     """
+    if field_id in KNOWN_STUB_FIELD_MAX_AREA:
+        return KNOWN_STUB_FIELD_MAX_AREA[field_id]
+
     for f in fields_data:
         if str(f.get("id")) == str(field_id):
             area = f.get("tillable_area")
@@ -743,7 +754,18 @@ def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, i
         if mt_id and field_id and str(field_id) != "0":
             # MachineTaskFieldMappingItem: поле обсягу роботи, яке МОЖНА редагувати, зветься
             # 'covered_area' (не 'work_amount' — того поля в схемі взагалі немає).
-            fm = {"data": {"machine_task_id": int(mt_id), "field_id": int(field_id), "covered_area": float(send_amount)}}
+            # ВАЖЛИВО: 'covered_area' САМ ПО СОБІ ігнорується сервером — Cropwise за замовчуванням
+            # розраховує оброблену площу з GPS/телеметрії треку машини. Оскільки в нас немає
+            # реального треку (дані створюються через API, не з бортового обладнання), система
+            # показує порожнє/дефолтне значення (площу самого поля), а наше covered_area мовчки
+            # ігнорується — САМЕ ТАК і виявилась ця проблема (площа "не відображалась" в UI).
+            # За документацією API, covered_area починає діяти лише коли manually_defined_covered_area=true.
+            fm = {"data": {
+                "machine_task_id": int(mt_id),
+                "field_id": int(field_id),
+                "covered_area": float(send_amount),
+                "manually_defined_covered_area": True,
+            }}
             fm_resp = api_request("POST", f"{API_BASE}/api/v3/machine_task_field_mapping_items", headers=get_headers(), data=json.dumps(fm, ensure_ascii=False).encode("utf-8"), timeout=10)
             if fm_resp.status_code in [200, 201]:
                 field_mapping_item_id = fm_resp.json().get("data", {}).get("id")
@@ -1019,7 +1041,9 @@ def run_mode_primary_import(session):
         excel_field_val = field_num_xl.strip().lower()
         field_id = None
         field_name = "Тех. поле (Заглушка 0.1 га)"
-        send_amount = actual_work_amount
+        send_amount = actual_work_amount  # ЗАВЖДИ реальна оброблена площа/обсяг — ніколи не обрізаємо тут.
+                                           # Обрізання (якщо потрібне) відбувається лише для AgroOperation
+                                           # нижче, через get_field_tillable_area + анотацію в назві.
 
         if excel_field_val and excel_field_val != "не вказано" and excel_field_val != "nan":
             matched_field = find_matching_field(excel_field_val, fields_data)
@@ -1032,20 +1056,33 @@ def run_mode_primary_import(session):
             print("  0  → Поставити заглушку (ID: 24, 0.1 га)")
             field_input = input("  Введіть назву поля або 0: ").strip().lower()
             if field_input == "0" or not field_input:
-                field_id, field_name, send_amount = 24, "Тех. поле (Заглушка 0.1 га)", 0.1
+                field_id, field_name = 24, "Тех. поле (Заглушка 0.1 га)"
             else:
                 manual_match = find_matching_field(field_input, fields_data)
                 if manual_match:
                     field_id = manual_match.get("id")
                     field_name = manual_match.get("name") or manual_match.get("title")
                 else:
-                    field_id, field_name, send_amount = 24, "Тех. поле (Заглушка 0.1 га)", 0.1
+                    field_id, field_name = 24, "Тех. поле (Заглушка 0.1 га)"
         elif not field_id:
             field_id = 24
-            send_amount = 0.1
 
-        description = f"Операція №{work_row_counter} (рядок Excel {excel_row_num})"
+        # Якщо реальний обсяг перевищує оброблювану площу поля (типово для технічних полів-заглушок,
+        # де tillable_area лише 0.1 га, але в обліковому листі пишуть скільки РЕАЛЬНО оброблено) —
+        # AgroOperation однаково прийме лише обрізане значення (нижче, в send_to_cropwise), тож тут
+        # додаємо позначку з фактичним обсягом прямо в назву/опис, щоб ця інформація не губилась.
+        display_work_name = work_name
+        field_tillable_area = get_field_tillable_area(field_id)
+        if field_tillable_area is not None and field_tillable_area > 0 and actual_work_amount > field_tillable_area:
+            amount_str = f"{actual_work_amount:g}"
+            unit_label = (unit_val or "од.").strip()
+            display_work_name = f"{work_name} (фактично виконано: {amount_str} {unit_label})"
 
+        description = (
+            f"Операція №{work_row_counter} "
+            f"(рядок Excel {excel_row_num}, "
+            f"фактично виконано {actual_work_amount:g} {(unit_val or 'од.').strip()})"
+            )
         try:
             d, mo, y = date_val.split(".")
             date_iso = f"{y}-{mo}-{d}"
@@ -1083,7 +1120,7 @@ def run_mode_primary_import(session):
 
         for old_id in replace_ids: delete_task(old_id)
 
-        mt_id, agro_id, field_mapping_item_id = send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, iso_end, season_year, send_amount, work_name, description)
+        mt_id, agro_id, field_mapping_item_id = send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, iso_end, season_year, send_amount, display_work_name, description)
 
         if mt_id:
             log_data[r_key] = {
@@ -1096,6 +1133,8 @@ def run_mode_primary_import(session):
                 "end_time": iso_end,
                 "work": work_name,
                 "field": field_name,
+                "actual_area": actual_work_amount,
+                "unit_val": unit_val,
                 "sent_at": datetime.now().isoformat(),
                 "fuel_updated": False
             }
@@ -1699,4 +1738,4 @@ def main():
             break
 
 if __name__ == "__main__":
-    main()
+    main()                                                                                
