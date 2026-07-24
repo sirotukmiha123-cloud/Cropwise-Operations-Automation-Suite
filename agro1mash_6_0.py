@@ -1704,7 +1704,7 @@ def print_final_report_mode3(log_path, stats, report_rows):
 # =====================================================
 def main():
     print("=" * 70)
-    print("🚀 CROPWISE АВТОПІЛОТ — Версія v9.0 (Імпорт + Пальне + Списання)")
+    print("🚀 CROPWISE АВТОПІЛОТ — Версія v10.2 (Імпорт + Пальне + Списання)")
     print("=" * 70)
 
     session = init_session()
