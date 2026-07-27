@@ -23,6 +23,17 @@ try:
 except Exception:
     C_OK = C_ERR = C_WARN = C_RESET = ""
 
+# Logging configuration: write detailed logs to a file and INFO to console
+import logging
+log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agro1mash.log")
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s',
+                    handlers=[
+                        logging.StreamHandler(sys.stdout),
+                        logging.FileHandler(log_file_path, encoding='utf-8')
+                    ])
+logger = logging.getLogger(__name__)
+
 def colorize_line(line):
     """Підсвічує рядок звіту зеленим/червоним/жовтим залежно від його змісту (якщо colorama доступна)."""
     if "✅" in line or "Успішно" in line:
@@ -38,7 +49,7 @@ def colorize_line(line):
 # =====================================================
 API_BASE = "https://operations.cropwise.com"
 
-CONFIG_EXAMPLE = '{\n  "cropwise_token": "Ваш токен тут"\n}'
+CONFIG_EXAMPLE = '{\n  "cropwise_token": "токен тут"\n}'
 
 def load_cropwise_token():
     """
@@ -78,6 +89,10 @@ def load_cropwise_token():
 
 CROPWISE_TOKEN = load_cropwise_token()
 
+# Управління режимом: за замовчуванням — лише локальне оновлення логів (без відправки на сервер).
+# Щоб дозволити реальні запити до сервера, запускайте скрипт з прапорцем --apply
+APPLY_TO_SERVER = '--apply' in sys.argv
+
 def get_headers():
     token = str(CROPWISE_TOKEN).strip().replace("\n", "").replace("\r", "")
     return {
@@ -88,31 +103,63 @@ def get_headers():
 
 def api_request(method, url, max_retries=3, **kwargs):
     """
-    Обгортка над requests.request з обробкою HTTP 429 (Too Many Requests):
-    чекає Retry-After (або зростаючу паузу) і повторює запит до max_retries разів.
-    Також повторює спробу при мережевих таймаутах/збоях з'єднання.
+    Надійніша обгортка над requests.request з експоненційним backoff:
+    - повторює при мережевих помилках і при помилках сервера (5xx) до max_retries разів;
+    - не повторює для клієнтських помилок (4xx), окрім 429 (Too Many Requests);
+    - обробляє Retry-After для 429;
+    - логгує короткі повідомлення про невдалі спроби.
+
+    Повертає об'єкт Response або піднімає виняток при повному провалі мережі.
     """
     last_exc = None
+    resp = None
     for attempt in range(max_retries + 1):
         try:
             resp = requests.request(method, url, **kwargs)
         except requests.exceptions.RequestException as e:
             last_exc = e
             if attempt < max_retries:
-                wait_s = 1.5 * (attempt + 1)
-                print(f"  ⏳ Мережева помилка ({e.__class__.__name__}), повтор через {wait_s:.1f} с...")
+                wait_s = (2 ** attempt)
+                logger.warning(f"Мережева помилка ({e.__class__.__name__}), повтор через {wait_s} с (спроба {attempt+1}/{max_retries})...")
                 time.sleep(wait_s)
                 continue
+            logger.error(f"Мережева помилка і вичерпані спроби: {e}")
             raise
-        if resp.status_code == 429 and attempt < max_retries:
+
+        status = resp.status_code
+        # Якщо 429 — поважаємо Retry-After заголовок або використовуємо backoff
+        if status == 429 and attempt < max_retries:
             retry_after = resp.headers.get("Retry-After")
             try:
-                wait_s = float(retry_after) if retry_after else 2.0 * (attempt + 1)
+                wait_s = float(retry_after) if retry_after else (2 ** attempt)
             except (TypeError, ValueError):
-                wait_s = 2.0 * (attempt + 1)
-            print(f"  ⏳ Сервер повернув 429 (забагато запитів). Пауза {wait_s:.1f} с. і повтор...")
+                wait_s = (2 ** attempt)
+            logger.warning(f"Сервер повернув 429 (Too Many Requests). Пауза {wait_s} с і повтор (спроба {attempt+1}/{max_retries})...")
             time.sleep(wait_s)
             continue
+
+        # Не повторюємо для клієнтських помилок (за винятком 429 вище)
+        if 400 <= status < 500:
+            # Повертаємо відповідь одразу — клієнтська помилка вимагає виправлення даних
+            logger.info(f"Клієнтська помилка {status} для {method} {url}")
+            return resp
+
+        # Для серверних помилок (5xx) пробуємо ще раз
+        if 500 <= status < 600 and attempt < max_retries:
+            wait_s = (2 ** attempt)
+            snippet = (resp.text[:200] + '...') if resp.text and len(resp.text) > 200 else resp.text
+            logger.warning(f"Серверна помилка {status}. Повтор через {wait_s} с (спроба {attempt+1}/{max_retries}). Відповідь сервера: {snippet}")
+            time.sleep(wait_s)
+            continue
+
+        # Усі інші коди повертаємо одразу (успіх або інші неочікувані коди)
+        logger.debug(f"Отримано відповідь {status} для {method} {url}")
+        return resp
+
+    # Після вичерпання спроб
+    if resp is not None and isinstance(resp, requests.models.Response):
+        # Повертаємо останню відповідь (можливо з помилкою), щоб виклик синхронно обробив її
+        print(f"  ❌ Вичерпано спроб для запиту {method} {url}. Останній статус: {resp.status_code}")
         return resp
     if last_exc:
         raise last_exc
@@ -513,8 +560,13 @@ def extract_row_essentials(row, session_month, session_year, excel_row_num):
 
     date_val, end_date_val = build_date_range(day_val, session_month, session_year)
 
+    raw_area_cell = row[22]
+    area_from_excel = False
     try:
-        actual_work_amount = float(str(row[22]).replace(",", "."))
+        # Визначаємо, чи є у Excel клітинка з площею (не NaN/порожня)
+        if pd.notna(raw_area_cell) and str(raw_area_cell).strip().lower() not in ("", "nan"):
+            area_from_excel = True
+        actual_work_amount = float(str(raw_area_cell).replace(",", "."))
     except:
         actual_work_amount = 0.0
 
@@ -534,6 +586,21 @@ def extract_row_essentials(row, session_month, session_year, excel_row_num):
 
     if actual_work_amount == 0.0 and actual_hours > 0:
         actual_work_amount = actual_hours
+        # Якщо значення заповнене з годин — це НЕ ручна площа з Excel
+        area_from_excel = False
+
+    # Якщо попередні значення не дали площі і увімкнено ручний режим — запросити у користувача
+    if actual_work_amount == 0.0 and MANUAL_AREA_INPUT:
+        while True:
+            val = input(f"  Рядок {excel_row_num}: вкажіть площу (га) вручну (або Enter щоб пропустити): ").strip()
+            if val == "":
+                break
+            try:
+                actual_work_amount = float(val.replace(',', '.'))
+                area_from_excel = True
+                break
+            except:
+                print("  ⚠️ Невірний формат. Введіть число, наприклад 12.5")
 
     field_short = clean_field_name_for_key(field_num_xl)
     key = row_key(date_val, work_name, field_short, excel_row_num)
@@ -550,6 +617,7 @@ def extract_row_essentials(row, session_month, session_year, excel_row_num):
         "actual_hours": actual_hours,
         "excel_time_val": excel_time_val,
         "excel_row_num": excel_row_num,
+        "area_from_excel": area_from_excel,
     }
 
 # =====================================================
@@ -649,6 +717,8 @@ def format_iso_with_kyiv_offset(date_str, time_str_hms):
 # можливо, поле в кеші має tillable_area=0 чи не заповнене, тоді як реальне обмеження на сервері
 # інше). Тому для відомих технічних полів застосовуємо гарантований резервний ліміт.
 KNOWN_STUB_FIELD_MAX_AREA = {24: 0.1, 25: 0.1}
+# Якщо увімкнено, при порожній площі у записі скрипт буде просити ввести її вручну
+MANUAL_AREA_INPUT = False
 
 def get_field_tillable_area(field_id):
     """
@@ -672,7 +742,7 @@ def get_field_tillable_area(field_id):
                 return None
     return None
 
-def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, iso_end, season_year, send_amount, work_name, description):
+def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, iso_end, season_year, send_amount, work_name, description, area_is_manual=False):
     agro_op_id = None
     if field_id and str(field_id) != "0":
         start_date = iso_start.split("T")[0]
@@ -714,21 +784,21 @@ def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, i
             }
         }
         try:
-            print(f"\n🔍 [ДЕБАГ АГРООП] Спроба відправки для: '{work_name}'")
-            print(f"   📊 Параметри: field_id={field_id}, work_type_id={work_type_id}, season={season_year}")
+            logger.info(f"[ДЕБАГ АГРООП] Спроба відправки для: '{work_name}'")
+            logger.info(f"  Параметри: field_id={field_id}, work_type_id={work_type_id}, season={season_year}")
 
             show_loading_animation("/api/v3/agro_operations", duration=0.2)
 
             url_agro = f"{API_BASE}/api/v3/agro_operations"
             r = api_request("POST", url_agro, headers=get_headers(), data=json.dumps(agro_payload, ensure_ascii=False).encode("utf-8"), timeout=15)
 
-            print(f"   📡 Статус відповіді сервера: {r.status_code}")
+            logger.info(f"  Статус відповіді сервера: {r.status_code}")
 
             if r.status_code in [200, 201]:
                 agro_op_id = r.json().get("data", {}).get("id")
-                print(f"   ✨ Успішно створено AgroOp! ID: {agro_op_id}")
+                logger.info(f"  Успішно створено AgroOp! ID: {agro_op_id}")
             else:
-                print(f"   ❌ Сервер Cropwise відхилив АгроОп: {r.text}")
+                logger.error(f"  Сервер Cropwise відхилив АгроОп: {r.status_code} {r.text}")
         except Exception as agro_err:
             print(f"   💥 Критична помилка відправки АгроОп: {agro_err}")
 
@@ -748,9 +818,11 @@ def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, i
     try:
         show_loading_animation("/api/v3/machine_tasks", duration=0.3)
         r = api_request("POST", f"{API_BASE}/api/v3/machine_tasks", headers=get_headers(), data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), timeout=15)
-        if r.status_code not in [200, 201]: return None, None, None
+        if r.status_code not in [200, 201]: return None, None, None, False, False
         mt_id = r.json().get("data", {}).get("id")
         field_mapping_item_id = None
+        field_linked = False
+        agro_linked = False
         if mt_id and field_id and str(field_id) != "0":
             # MachineTaskFieldMappingItem: поле обсягу роботи, яке МОЖНА редагувати, зветься
             # 'covered_area' (не 'work_amount' — того поля в схемі взагалі немає).
@@ -760,21 +832,38 @@ def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, i
             # показує порожнє/дефолтне значення (площу самого поля), а наше covered_area мовчки
             # ігнорується — САМЕ ТАК і виявилась ця проблема (площа "не відображалась" в UI).
             # За документацією API, covered_area починає діяти лише коли manually_defined_covered_area=true.
+            #
+            # ВАЖЛИВО #2: covered_area використовує ТЕ САМЕ обрізане значення (agro_area), що й
+            # AgroOperation, а не сирий send_amount — інакше для маленьких технічних полів (напр.
+            # "н.п." з tillable_area 0.1 га) цей запит теж міг мовчки відхилятись сервером, і поле
+            # так і не прив'язувалось до завдання (справжня причина проблеми "не зв'язується").
+            # Реальний (нескорочений) обсяг роботи все одно не губиться — він написаний у назві
+            # AgroOperation через display_work_name/"(фактично виконано: ...)".
             fm = {"data": {
                 "machine_task_id": int(mt_id),
                 "field_id": int(field_id),
-                "covered_area": float(send_amount),
-                "manually_defined_covered_area": True,
+                "covered_area": agro_area,
+                "manually_defined_covered_area": bool(area_is_manual),
             }}
             fm_resp = api_request("POST", f"{API_BASE}/api/v3/machine_task_field_mapping_items", headers=get_headers(), data=json.dumps(fm, ensure_ascii=False).encode("utf-8"), timeout=10)
             if fm_resp.status_code in [200, 201]:
                 field_mapping_item_id = fm_resp.json().get("data", {}).get("id")
+                field_linked = True
+            else:
+                # При помилці — не встановлюємо нічого, але продовжуємо (скрипт створює MachineTask/AgroOp)
+                logger.warning(f"Не вдалося прив'язати поле до завдання (MachineTaskFieldMappingItem): {fm_resp.status_code} {fm_resp.text}")
+
             if agro_op_id:
                 am = {"data": {"machine_task_id": int(mt_id), "agro_operation_id": int(agro_op_id)}}
-                api_request("POST", f"{API_BASE}/api/v3/machine_task_agro_operation_mapping_items", headers=get_headers(), data=json.dumps(am, ensure_ascii=False).encode("utf-8"), timeout=10)
-        return mt_id, agro_op_id, field_mapping_item_id
+                am_resp = api_request("POST", f"{API_BASE}/api/v3/machine_task_agro_operation_mapping_items", headers=get_headers(), data=json.dumps(am, ensure_ascii=False).encode("utf-8"), timeout=10)
+                if am_resp.status_code in [200, 201]:
+                    agro_linked = True
+                else:
+                    print(f"   ⚠️  AgroOp AO-{agro_op_id} створено, але НЕ вдалося зв'язати із завданням "
+                          f"MT-{mt_id} (MachineTaskAgroOperationMappingItem): {am_resp.status_code} {am_resp.text}")
+        return mt_id, agro_op_id, field_mapping_item_id, field_linked, agro_linked
     except:
-        return None, None, None
+        return None, None, None, False, False
 
 def get_field_mapping_item_id(machine_task_id, field_id=None):
     """
@@ -924,7 +1013,8 @@ def init_session():
 # =====================================================
 # РЕЖИМ 1: ПЕРВИННИЙ ІМПОРТ РОБІТ + СТВОРЕННЯ ЛОГУ
 # =====================================================
-def run_mode_primary_import(session):
+def run_mode_primary_import(session, non_interactive=False):
+
     session_month, session_year = session["month"], session["year"]
     driver_id, machine_id = session["driver_id"], session["machine_id"]
     driver_name_str, machine_name_str = session["driver_name"], session["machine_name"]
@@ -1078,11 +1168,8 @@ def run_mode_primary_import(session):
             unit_label = (unit_val or "од.").strip()
             display_work_name = f"{work_name} (фактично виконано: {amount_str} {unit_label})"
 
-        description = (
-            f"Операція №{work_row_counter} "
-            f"(рядок Excel {excel_row_num}, "
-            f"фактично виконано {actual_work_amount:g} {(unit_val or 'од.').strip()})"
-            )
+        description = f"Операція №{work_row_counter} (рядок Excel {excel_row_num})"
+
         try:
             d, mo, y = date_val.split(".")
             date_iso = f"{y}-{mo}-{d}"
@@ -1110,6 +1197,12 @@ def run_mode_primary_import(session):
         replace_ids = []
         if duplicates:
             print(f"\n⚠️  [РЕЖИМ ДЕБАГУ 00] Знайдено дублікати для робочої операції №{work_row_counter}!")
+            # Якщо без інтерактивності, автоматично пропускаємо дублікати, щоб не створювати нові
+            if non_interactive:
+                logger.info(f"Автоматично пропускаємо дублікати для операції №{work_row_counter} (non-interactive)")
+                final_registry.append([work_row_counter, work_name, "ІСНУЄ", "ІСНУЄ", time_formatted, f"{actual_work_amount} {unit_val}", "Пропущено (дублікати, non-interactive)"])
+                continue
+
             print("  1  → Пропустити (Залишити старе завдання)")
             print("  11 → Перезаписати (Видалити старі з сервера та залити нове)")
             dup_ch = input("  Вибір: ").strip()
@@ -1120,7 +1213,41 @@ def run_mode_primary_import(session):
 
         for old_id in replace_ids: delete_task(old_id)
 
-        mt_id, agro_id, field_mapping_item_id = send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, iso_end, season_year, send_amount, display_work_name, description)
+        if APPLY_TO_SERVER:
+            mt_id, agro_id, field_mapping_item_id, field_linked, agro_linked = send_to_cropwise(
+                driver_id, machine_id, work_type_id, field_id, iso_start, iso_end, season_year,
+                send_amount, display_work_name, description, area_is_manual=essentials.get("area_from_excel", False)
+            )
+        else:
+            # Режим only-local: пропускаємо відправку на сервер, але оновлюємо локальний лог
+            logger.info(f"[LOCAL ONLY] Пропуск відправки на сервер для ряду {excel_row_num} — оновлення локального логу");
+            mt_id = None
+            agro_id = None
+            field_mapping_item_id = None
+            field_linked = False
+            agro_linked = False
+            # Записуємо локальну інформацію відразу (не створюємо статус 'sent')
+            log_data[r_key] = {
+                "status": "local",
+                "machine_task_id": None,
+                "agro_operation_id": None,
+                "field_mapping_item_id": None,
+                "field_id": field_id,
+                "field_linked": False,
+                "agro_linked": False,
+                "date": date_val,
+                "end_time": iso_end,
+                "work": work_name,
+                "field": field_name,
+                "actual_area": actual_work_amount,
+                "unit_val": unit_val,
+                "sent_at": datetime.now().isoformat(),
+                "fuel_updated": False,
+                "manual_area": essentials.get("area_from_excel", False)
+            }
+            save_log(log_path, log_data)
+            final_registry.append([work_row_counter, work_name, "LOCAL", "LOCAL", time_formatted, f"{actual_work_amount} {unit_val}", "Локально оновлено (без відправки)"])
+            continue
 
         if mt_id:
             log_data[r_key] = {
@@ -1129,6 +1256,8 @@ def run_mode_primary_import(session):
                 "agro_operation_id": agro_id,
                 "field_mapping_item_id": field_mapping_item_id,
                 "field_id": field_id,
+                "field_linked": field_linked,
+                "agro_linked": agro_linked,
                 "date": date_val,
                 "end_time": iso_end,
                 "work": work_name,
@@ -1136,11 +1265,24 @@ def run_mode_primary_import(session):
                 "actual_area": actual_work_amount,
                 "unit_val": unit_val,
                 "sent_at": datetime.now().isoformat(),
-                "fuel_updated": False
+                "fuel_updated": False,
+                "manual_area": essentials.get("area_from_excel", False)
             }
             save_log(log_path, log_data)
-            stats["sent"] += 1
-            final_registry.append([work_row_counter, work_name, f"MT-{mt_id}", f"AO-{agro_id}" if agro_id else "-", time_formatted, f"{actual_work_amount} {unit_val}", "✅ Успішно"])
+
+            # Статус у звіті тепер чесно відображає, чи ВСЕ реально прив'язалось, а не лише факт
+            # створення MachineTask — раніше зв'язки могли мовчки не створитись (сервер відхиляв
+            # запит), а звіт все одно писав "✅ Успішно".
+            if field_id and str(field_id) != "0" and not field_linked:
+                stats["error"] += 1
+                status_text = "⚠️ Поле НЕ прив'язано до завдання (перевірте вручну)"
+            elif agro_id and not agro_linked:
+                stats["error"] += 1
+                status_text = "⚠️ АгроОп створено, але НЕ зв'язано із завданням"
+            else:
+                stats["sent"] += 1
+                status_text = "✅ Успішно"
+            final_registry.append([work_row_counter, work_name, f"MT-{mt_id}", f"AO-{agro_id}" if agro_id else "-", time_formatted, f"{actual_work_amount} {unit_val}", status_text])
         else:
             stats["error"] += 1
             final_registry.append([work_row_counter, work_name, "ПОМИЛКА", "ПОМИЛКА", time_formatted, f"{actual_work_amount} {unit_val}", "❌ Відхилено сервером"])
@@ -1179,6 +1321,219 @@ def print_final_report_mode1(driver_name_str, machine_name_str, session_month, s
         print(f"💾 Текстову копію цього звіту збережено:\n   📁 {report_file_path}")
     except:
         print(f"❌ Не вдалося зберегти фінальний звіт у файл:\n   📁 {report_file_path}")
+
+# =====================================================
+# РЕЖИМ 4: РЕМОНТ / СИНХРОНІЗАЦІЯ EXCEL + СТАРОГО ЛОГУ
+#  - Приймає Excel + старий лог, підставляє площі з Excel для рядків у логу,
+#    показує фінальний звіт, пропонує замінити лог, а потім — надіслати відсутні записи на сервер.
+# =====================================================
+def run_mode_repair(session, non_interactive=False):
+    session_month, session_year = session["month"], session["year"]
+    driver_id, machine_id = session["driver_id"], session["machine_id"]
+
+    raw_excel = input("\n📂 Шлях до Excel-файлу (можна перетягнути файл у консоль): ").strip()
+    excel_file = clean_file_path(raw_excel)
+    if not os.path.exists(excel_file):
+        print("❌ Excel файл не знайдено!")
+        return
+
+    raw_log = input("📂 Шлях до старого логу (JSON): ").strip()
+    log_file = clean_file_path(raw_log)
+    if not os.path.exists(log_file):
+        print("❌ Log файл не знайдено!")
+        return
+
+    # Завантажуємо Excel і лог
+    try:
+        df = pd.read_excel(excel_file, header=None, engine='openpyxl')
+    except Exception as e:
+        print(f"❌ Помилка Excel: {e}")
+        return
+
+    log_data = load_log(log_file)
+    valid_rows = [(index, row) for index, row in df.iterrows() if is_valid_work_row(row)]
+    if not valid_rows:
+        print("⚠️ У файлі не знайдено валідних робочих рядків")
+        return
+
+    print(f"✅ Знайдено {len(valid_rows)} робочих рядків. Починаю синхронізацію з логом...")
+
+    final_registry = []
+    updated = 0
+    skipped = 0
+    errors = 0
+
+    for idx, row in valid_rows:
+        excel_row_num = idx + 1
+        essentials = extract_row_essentials(row, session_month, session_year, excel_row_num)
+        r_key = essentials['key']
+        # Якщо запис уже є і має статус 'sent' — пропускаємо
+        existing = log_data.get(r_key, {})
+        if existing.get('status') == 'sent':
+            skipped += 1
+            final_registry.append([excel_row_num, essentials['work_name'], 'SENT', existing.get('agro_operation_id') or '-', essentials.get('excel_time_val'), f"{essentials['actual_work_amount']} {essentials['unit_val']}", 'Існує на сервері'])
+            continue
+
+        # Визначаємо поле/field_id як у primary import
+        excel_field_val = essentials['field_num_xl'].strip().lower()
+        field_id = None
+        field_name = 'Тех. поле (Заглушка 0.1 га)'
+        if excel_field_val and excel_field_val != 'не вказано' and excel_field_val != 'nan':
+            matched_field = find_matching_field(excel_field_val, fields_data)
+            if matched_field:
+                field_id = matched_field.get('id')
+                field_name = matched_field.get('name') or matched_field.get('title')
+        if not field_id and excel_field_val and excel_field_val != 'не вказано' and excel_field_val != 'nan':
+            # залишаємо заглушку, якщо не знайшли
+            print(f"Поле '{essentials['field_num_xl']}' не розпізнано — використовуємо заглушку (ID 24)")
+            field_id = 24
+
+        # Підставляємо площу з Excel (або введену вручну під час extract_row_essentials)
+        actual_work_amount = essentials['actual_work_amount']
+
+        # Відновлюємо час з Excel (схоже на логіку в режимі 1)
+        excel_time_val = essentials.get('excel_time_val')
+        parsed_range = parse_flexible_time(excel_time_val)
+        # Maintain simple per-day chaining to mimic primary import behavior
+        if 'repair_day_time_memory' not in locals():
+            repair_day_time_memory = {}
+        if parsed_range:
+            time_formatted = parsed_range
+            try:
+                end_h, end_m = map(int, parsed_range.split("-")[1].split(":"))
+            except:
+                end_h = end_m = None
+            repair_day_time_memory[essentials['date_val']] = (end_h * 60 + end_m) if end_h is not None else repair_day_time_memory.get(essentials['date_val'], 8*60)
+        else:
+            start_total_min = repair_day_time_memory.get(essentials['date_val'], 8 * 60)
+            duration_min = round(essentials.get('actual_hours', 1.0) * 60)
+            end_total_min = start_total_min + duration_min
+            start_h, start_m = divmod(start_total_min % (24 * 60), 60)
+            end_h, end_m = divmod(end_total_min % (24 * 60), 60)
+            time_formatted = f"{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}"
+            repair_day_time_memory[essentials['date_val']] = end_total_min
+
+        # Сформуємо ISO-дати (iso_start / iso_end) як в основному режимі
+        iso_start = iso_end = None
+        try:
+            d, mo, y = essentials['date_val'].split('.')
+            sh, eh = time_formatted.split('-')
+            sh_h, sh_m = map(int, sh.strip().split(':'))
+            eh_h, eh_m = map(int, eh.strip().split(':'))
+            end_date_for_iso = essentials['end_date_val']
+            if (eh_h * 60 + eh_m) <= (sh_h * 60 + sh_m) and end_date_for_iso == essentials['date_val']:
+                end_date_for_iso = add_one_day_to_date_str(essentials['date_val'])
+            ed, emo, ey = end_date_for_iso.split('.')
+            iso_start = f"{y}-{mo}-{d}T{sh.strip()}:00"
+            iso_end = f"{ey}-{emo}-{ed}T{eh.strip()}:00"
+        except:
+            iso_start = None
+            iso_end = None
+
+        # Оновлюємо локальний запис логу — статус local (підготовлено до відправки)
+        log_data[r_key] = {
+            'status': 'local',
+            'machine_task_id': None,
+            'agro_operation_id': None,
+            'field_mapping_item_id': None,
+            'field_id': field_id,
+            'field_linked': False,
+            'agro_linked': False,
+            'date': essentials['date_val'],
+            'time_formatted': time_formatted,
+            'iso_start': iso_start,
+            'iso_end': iso_end,
+            'end_time': iso_end,
+            'work': essentials['work_name'],
+            'field': field_name,
+            'actual_area': actual_work_amount,
+            'unit_val': essentials.get('unit_val'),
+            'sent_at': datetime.now().isoformat(),
+            'fuel_updated': False,
+            'manual_area': essentials.get('area_from_excel', False)
+        }
+        updated += 1
+        final_registry.append([excel_row_num, essentials['work_name'], 'LOCAL', '-', time_formatted, f"{actual_work_amount} {essentials.get('unit_val')}", 'Заповнено з Excel'])
+
+    # Показуємо фінальний звіт (короткий)
+    print('\n=== Фінальний звіт синхронізації ===')
+    print(f'Оновлено записів: {updated}, Пропущено (вже відправлені): {skipped}, Помилок: {errors}')
+
+    # Питаємо чи замінити старий лог
+    ch = input('\nЗберегти оновлений лог замість вказаного файлу? (т/н): ').strip().lower()
+    if ch in ('т','так','y','yes'):
+        save_log(log_file, log_data)
+        print(f'💾 Лог оновлено: {log_file}')
+    else:
+        # збережемо як new_<original>
+        new_path = log_file + '.patched.json'
+        save_log(new_path, log_data)
+        print(f'💾 Оновлений лог збережено як: {new_path}')
+
+    # Питання: відправити відсутні записи на сервер зараз?
+    ch2 = input('\nВідправити записи зі статусом local на сервер зараз? (т/н): ').strip().lower()
+    if ch2 in ('т','так','y','yes'):
+        # Якщо APPLY_TO_SERVER не встановлено, попереджаємо і питаємо підтвердження
+        if not APPLY_TO_SERVER:
+            ch_apply = input('Для відправки потрібно дозволити server-режим (--apply). Ви хочете продовжити в цьому сеансі і надіслати зараз? (т/н): ').strip().lower()
+            if ch_apply not in ('т','так','y','yes'):
+                print('Відправка скасована. Ви можете запустити скрипт з --apply пізніше.')
+                return
+        # Проходимо по логу і надсилаємо записи зі статусом local
+        to_send = [ (k,v) for k,v in log_data.items() if v.get('status') != 'sent' ]
+        print(f'Починаю відправку {len(to_send)} записів...')
+        for k,v in to_send:
+            # Не намагаємось повторно відправляти ті, що вже мають machine_task_id/agro_operation_id
+            try:
+                # Для відправки нам потрібні ті параметри, що формуються у primary import
+                # Розпарсимо ключ або знайдемо відповідний рядок у Excel — простіше: збережені поля містять field_id і actual_area
+                field_id = v.get('field_id')
+                send_amount = v.get('actual_area') or 0.0
+                # Для часу/season: коли є iso_start/iso_end у логу — використовуємо їх, інакше намагаємось зібрати з date
+                iso_start = v.get('iso_start')
+                iso_end = v.get('iso_end')
+                season_year = session_year
+                if not iso_start or not iso_end:
+                    date_iso = v.get('date')
+                    try:
+                        d, mo, y = date_iso.split('.')
+                        # Якщо у логу є time_formatted (збережений з Excel) — використаємо його
+                        tf = v.get('time_formatted')
+                        if tf:
+                            sh, eh = tf.split('-')
+                            iso_start = f"{y}-{mo}-{d}T{sh.strip()}:00"
+                            # обробка переходу через північ схожа до primary (спрощено тут)
+                            iso_end = f"{y}-{mo}-{d}T{eh.strip()}:00"
+                            season_year = int(y)
+                        else:
+                            iso_start = f"{y}-{mo}-{d}T08:00:00"
+                            iso_end = f"{y}-{mo}-{d}T09:00:00"
+                            season_year = int(y)
+                    except:
+                        iso_start = None; iso_end = None; season_year = session_year
+
+                work_name = v.get('work')
+                description = f"Ремонт/синхронізація: {work_name}"
+                # Викликаємо send_to_cropwise без перевірки APPLY_TO_SERVER, але з коректним прапором area_is_manual
+                area_is_manual = bool(v.get('manual_area', False))
+                mt_id, agro_id, field_mapping_item_id, field_linked, agro_linked = send_to_cropwise(
+                    driver_id, machine_id, None, field_id, iso_start, iso_end, season_year, send_amount, work_name, description, area_is_manual=area_is_manual
+                )
+                if mt_id:
+                    v['status'] = 'sent'
+                    v['machine_task_id'] = mt_id
+                    v['agro_operation_id'] = agro_id
+                    v['field_mapping_item_id'] = field_mapping_item_id
+                    v['field_linked'] = field_linked
+                    v['agro_linked'] = agro_linked
+                    save_log(log_file, log_data)
+                    logger.info(f"Успішно надіслано: {k} -> MT-{mt_id} AO-{agro_id}")
+                else:
+                    logger.error(f"Не вдалося надіслати запис: {k}")
+            except Exception as e:
+                logger.error(f"Помилка при відправці запису {k}: {e}")
+
+    print('\n🔚 Режим РЕМОНТ завершено.')
 
 # =====================================================
 # РЕЖИМ 2: ДОДАВАННЯ ПАЛЬНОГО (ОНОВЛЕННЯ ЗА ЛОГОМ)
@@ -1704,10 +2059,17 @@ def print_final_report_mode3(log_path, stats, report_rows):
 # =====================================================
 def main():
     print("=" * 70)
-    print("🚀 CROPWISE АВТОПІЛОТ — Версія v10.2 (Імпорт + Пальне + Списання (Додана площа))")
+    print("🚀 CROPWISE АВТОПІЛОТ — Версія v10.2 (Імпорт + Пальне + Списання)")
     print("=" * 70)
 
+    global MANUAL_AREA_INPUT
+    ch = input("Чи ввімкнути режим 'площа задана вручну' для рядків з відсутньою площею? (т/н): ").strip().lower()
+    MANUAL_AREA_INPUT = ch in ("т", "так", "y", "yes")
     session = init_session()
+
+    # Параметри без інтерактивності: --apply дозволяє відправляти на сервер,
+    # а --yes дозволяє автоматично пропускати дублікати (корисно для пакетної обробки старих логів).
+    NON_INTERACTIVE = '--yes' in sys.argv
 
     while True:
         print("\n" + "=" * 70)
@@ -1715,23 +2077,25 @@ def main():
         print("  1 → Первинний імпорт робіт та створення логу")
         print("  2 → Додавання пального (оновлення за логом)")
         print("  3 → Автоматичне списання пального зі складу 🚀")
+        print("  4 → РЕМОНТ: синхронізація Excel + старого логу (підстановка площі, підготовка до відправки)")
         print("  0 → Вихід")
         print("=" * 70)
         mode = input("👉 Ваш вибір: ").strip()
 
         if mode == "1":
-            run_mode_primary_import(session)
+            run_mode_primary_import(session, non_interactive=NON_INTERACTIVE)
         elif mode == "2":
-            run_mode_fuel_update(session)
+            run_mode_fuel_update(session, non_interactive=NON_INTERACTIVE)
         elif mode == "3":
-            run_mode_fuel_write_off(session)
+            run_mode_fuel_write_off(session, non_interactive=NON_INTERACTIVE)
+        elif mode == "4":
+            run_mode_repair(session, non_interactive=NON_INTERACTIVE)
         elif mode == "0":
             print("👋 Роботу завершено.")
             break
         else:
             print("⚠️  Невірний вибір, спробуйте ще раз.")
             continue
-
         again = input("\n🔁 Виконати ще одну дію в цій самій сесії (той самий водій/машина)? (т/н): ").strip().lower()
         if again not in ("т", "так", "y", "yes"):
             print("👋 Роботу завершено.")
