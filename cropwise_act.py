@@ -93,7 +93,7 @@ def process_single_field(df, nomenclature_items, field_id, field_name, qty_col_l
             "document_type": "goods_issue",
             "document_status": "draft",
             "document_time": "2026-05-31T23:59:00.000+03:00",
-            "from_warehouse_id": 13,
+            "from_warehouse_id": id,
             "additional_info": additional_info_text
         }
     }
@@ -134,7 +134,7 @@ def process_single_field(df, nomenclature_items, field_id, field_name, qty_col_l
         
         forced_helper = False
         if not item_id:
-            item_id = 169
+            item_id = id
             display_description = f"- {name}"
             forced_helper = True
         else:
@@ -266,7 +266,7 @@ def create_word_wh_document(field_id, field_name, act_number, doc_date):
 
 
 def send_single_word_item(doc_id, item, nomenclature_items, position):
-    """Відправляє одну позицію насіння до документу doc_id з фолбеком на ID 169."""
+    """Відправляє одну позицію насіння до документу doc_id з фолбеком на ID id."""
     name  = item["name"]
     qty   = item["qty"]
     price = item["price"]
@@ -281,13 +281,13 @@ def send_single_word_item(doc_id, item, nomenclature_items, position):
 
     forced_helper = False
     if not item_id:
-        item_id = 169
+        item_id = id
         display_name = f"- {name}"
         forced_helper = True
     else:
         display_name = name
 
-    active_unit_id = 1
+    active_unit_id = id
     if not forced_helper:
         try:
             r = api_request("GET", f"{API_BASE}/api/v3/wh_items/{item_id}", headers=get_headers(), timeout=10)
