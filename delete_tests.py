@@ -8,8 +8,8 @@ delete_tests.py — швидка зачистка тестових складс�
 from cropwise_common import API_BASE, get_headers, api_request
 
 # Вкажи діапазон ID документів, які треба стерти (від якого і до якого включно)
-START_ID = 1449
-END_ID = 1470
+START_ID = id
+END_ID = id
 
 
 def clean_test_documents():
