@@ -49,11 +49,11 @@ def run_waiting_import():
         print(f"❌ Файл не знайдено!")
         return
 
-    try: target_warehouse_id = int(input("🏢 Введіть ID Складу призначення [13]: ").strip())
-    except: target_warehouse_id = 13
+    try: target_warehouse_id = int(input("🏢 Введіть ID Складу призначення: ").strip())
+    except: target_warehouse_id =
 
-    try: counterparty_id = int(input("🤝 Введіть ID Контрагента [9]: ").strip())
-    except: counterparty_id = 9
+    try: counterparty_id = int(input("🤝 Введіть ID Контрагента: ").strip())
+    except: counterparty_id = 
 
     df = pd.read_excel(excel_file, header=None, engine='openpyxl')
     print(" ✅ Файл Excel успішно зчитано!")
