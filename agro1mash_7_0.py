@@ -9,6 +9,8 @@ import sys
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
+from agro1mash_path_helpers import resolve_fuel_update_paths
+
 try:
     from openpyxl.utils import column_index_from_string
 except Exception:
@@ -937,6 +939,35 @@ def is_manually_defined_area(entry):
     return bool(entry.get('manual_area')) or str(entry.get('manual_area_source')).lower() in ('prompt', 'repair')
 
 
+def resolve_effective_area(field_id, raw_area):
+    if raw_area is None:
+        return None
+    try:
+        value = float(raw_area)
+    except (TypeError, ValueError):
+        return None
+    tillable_area = get_field_tillable_area(field_id)
+    if tillable_area is not None and tillable_area > 0 and value > tillable_area:
+        return tillable_area
+    return value
+
+
+def build_area_display_suffix(actual_area, unit_label, area_is_manual=False, field_id=None, resolved_area=None):
+    if actual_area is None:
+        return ""
+    try:
+        actual_value = float(actual_area)
+    except (TypeError, ValueError):
+        return ""
+    if area_is_manual and resolved_area is not None and resolved_area < actual_value:
+        return f" (площа вказана вручну: {actual_value:g} {unit_label}; на сервері обмежено до {resolved_area:g} {unit_label})"
+    if area_is_manual:
+        return f" (площа вказана вручну: {actual_value:g} {unit_label})"
+    if resolved_area is not None and field_id and resolved_area < actual_value:
+        return f" (обмежено до {resolved_area:g} {unit_label})"
+    return f" (фактично виконано: {actual_value:g} {unit_label})"
+
+
 def is_area_quantity(entry):
     unit_val = str(entry.get('unit_val', '')).strip()
     unit_class = classify_unit(unit_val)
@@ -952,6 +983,7 @@ def is_area_quantity(entry):
 
 def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, iso_end, season_year, send_amount, work_name, description, area_is_manual=False):
     agro_op_id = None
+    effective_area = resolve_effective_area(field_id, send_amount) if field_id and send_amount is not None else None
     # AgroOperation створюємо і для погодинних робіт. Для них площа не
     # передається взагалі, а години залишаються в назві та описі операції.
     if field_id and str(field_id) != "0":
@@ -969,13 +1001,7 @@ def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, i
         # Обмежуємо площу агрооперації реальною оброблюваною площею поля (якщо вона менша за
         # надіслану) — сервер інакше відхиляє запит для маленьких технічних об'єктів
         # (сміттєзвалище, бурт для гною тощо), а не лише для заглушки ID 24/25.
-        agro_area = None
-        if send_amount is not None:
-            tillable_area = get_field_tillable_area(field_id)
-            if tillable_area is not None and tillable_area > 0 and float(send_amount) > tillable_area:
-                agro_area = tillable_area
-            else:
-                agro_area = float(send_amount)
+        agro_area = effective_area
 
         # ПРИМІТКА: 'custom_name' — валідне поле лише для /api/v3a/agro_operations, у v3 його немає.
         # Назву роботи й так передаємо через 'description'.
@@ -1025,10 +1051,18 @@ def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, i
         "description": str(description),
         "season": season_year,
         "start_time": iso_start,
-        "end_time": iso_end
+        "end_time": iso_end,
+        "status": "done"
     }}
-    if send_amount is not None:
-        payload["data"]["work_area"] = float(send_amount)
+    if field_id and str(field_id) != "0":
+        payload["data"]["field_id"] = int(field_id)
+    if effective_area is not None:
+        area_value = float(effective_area)
+        payload["data"]["work_area"] = area_value
+        # Сумісність із старими версіями API: деякі інстанси Cropwise/візуалізації
+        # показують площу саме з "work_amount" на MachineTask, а не лише з
+        # сучасного "work_area". Якщо сервер ігнорує одне поле, друге може відобразитись.
+        payload["data"]["work_amount"] = area_value
     try:
         show_loading_animation("/api/v3/machine_tasks", duration=0.3)
         r = api_request("POST", f"{API_BASE}/api/v3/machine_tasks", headers=get_headers(), data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), timeout=15)
@@ -1059,9 +1093,11 @@ def send_to_cropwise(driver_id, machine_id, work_type_id, field_id, iso_start, i
             }
             # Для погодинної роботи поле прив'язуємо без площі.
             # Площинні поля додаємо тільки для гектарних операцій.
-            if send_amount is not None:
-                fm_data["covered_area"] = agro_area
-                fm_data["manually_defined_covered_area"] = bool(area_is_manual)
+            if effective_area is not None:
+                fm_data["covered_area"] = effective_area
+                # For API-created tasks there is no machine track, so Cropwise only honors
+                # covered_area when it is explicitly marked as manually defined.
+                fm_data["manually_defined_covered_area"] = True
             fm = {"data": fm_data}
             fm_resp = api_request("POST", f"{API_BASE}/api/v3/machine_task_field_mapping_items", headers=get_headers(), data=json.dumps(fm, ensure_ascii=False).encode("utf-8"), timeout=10)
             if fm_resp.status_code in [200, 201]:
@@ -1354,8 +1390,10 @@ def run_mode_primary_import(session, non_interactive=False):
 
     excel_file = ensure_session_folder(excel_file, driver_name_str, machine_name_str, session_month, session_year)
     session["primary_excel_file"] = excel_file
+    session["last_excel_file"] = excel_file
 
     log_path = generate_log_path_for_excel(excel_file)
+    session["last_log_path"] = log_path
     log_data = load_log(log_path)
     print(f"📁 Лог сесії: {log_path}")
 
@@ -1484,22 +1522,21 @@ def run_mode_primary_import(session, non_interactive=False):
 
         # Якщо реальний обсяг перевищує оброблювану площу поля (типово для технічних полів-заглушок,
         # де tillable_area лише 0.1 га, але в обліковому листі пишуть скільки РЕАЛЬНО оброблено) —
-        # AgroOperation однаково прийме лише обрізане значення (нижче, в send_to_cropwise), тож тут
-        # додаємо позначку з фактичним обсягом прямо в назву/опис, щоб ця інформація не губилась.
+        # AgroOperation прийме лише обрізане значення (нижче, в send_to_cropwise), тож тут
+        # додаємо позначку прямо в назву/опис, щоб не втратити сенс і явно показати режим вручної/обрізаної площі.
         display_work_name = work_name
+        unit_label = (unit_val or "од.").strip()
+        area_is_manual = essentials.get("area_source") in ("prompt", "repair")
+        resolved_area = resolve_effective_area(field_id, actual_work_amount) if unit_type == "area" else None
         if unit_type == "time":
             display_work_name = f"{work_name} ({actual_hours:g} год.)"
-        field_tillable_area = get_field_tillable_area(field_id)
-        if unit_type == "area" and field_tillable_area is not None and field_tillable_area > 0 and actual_work_amount > field_tillable_area:
-            amount_str = f"{actual_work_amount:g}"
-            unit_label = (unit_val or "од.").strip()
-            display_work_name = f"{work_name} (фактично виконано: {amount_str} {unit_label})"
+        elif unit_type == "area":
+            display_work_name = f"{work_name}{build_area_display_suffix(actual_work_amount, unit_label, area_is_manual=area_is_manual, field_id=field_id, resolved_area=resolved_area)}"
 
-        unit_label = (unit_val or "од.").strip()
         if unit_type == "time":
             description = f"Операція №{work_row_counter} (рядок Excel {excel_row_num}) — {display_work_name}"
         else:
-            description = f"Операція №{work_row_counter} (рядок Excel {excel_row_num}) — {display_work_name}; фактично виконано {actual_work_amount:g} {unit_label}"
+            description = f"Операція №{work_row_counter} (рядок Excel {excel_row_num}) — {display_work_name}"
 
         try:
             d, mo, y = date_val.split(".")
@@ -1535,9 +1572,14 @@ def run_mode_primary_import(session, non_interactive=False):
                 continue
 
             print("  1  → Пропустити (Залишити старе завдання)")
+            print("  2  → Створити ще одне завдання (без видалення старого)")
             print("  11 → Перезаписати (Видалити старі з сервера та залити нове)")
             dup_ch = input("  Вибір: ").strip()
-            if dup_ch == "11": replace_ids = [d["id"] for d in duplicates]
+            if dup_ch == "11":
+                replace_ids = [d["id"] for d in duplicates]
+            elif dup_ch in ("2", "111"):
+                final_registry.append([work_row_counter, work_name, "NEW", "NEW", time_formatted, f"{actual_work_amount} {unit_val}", "Створено нове дублююче завдання"])
+                # Не перериваємо обробку — просто продовжуємо як звичайну нову операцію.
             else:
                 final_registry.append([work_row_counter, work_name, "ІСНУЄ", "ІСНУЄ", time_formatted, f"{actual_work_amount} {unit_val}", "Пропущено за вибором"])
                 continue
@@ -1949,9 +1991,6 @@ def run_mode_repair(session, non_interactive=False):
 
                 work_name = entry.get('work')
                 unit_label = (entry.get('unit_val') or 'од.').strip()
-                description = f"Ремонт/синхронізація: {work_name} (фактично виконано {entry.get('actual_area', 0):g} {unit_label})"
-
-                # Якщо рядок є часовим (unit_type == time), не передаємо годин як площу.
                 area_is_valid = is_area_quantity(entry)
                 field_id = entry.get('field_id')
                 raw_area = entry.get('actual_area') or 0.0
@@ -1959,13 +1998,13 @@ def run_mode_repair(session, non_interactive=False):
                     raw_area = float(raw_area)
                 except:
                     raw_area = 0.0
-                agro_area_to_send = raw_area if area_is_valid else None
+                agro_area_to_send = resolve_effective_area(field_id, raw_area) if area_is_valid and field_id else (raw_area if area_is_valid else None)
+                area_is_manual = is_manually_defined_area(entry)
+                if area_is_valid and field_id and raw_area > 0 and agro_area_to_send is not None and agro_area_to_send < raw_area:
+                    logger.info(f"Обрізано площу {raw_area} -> {agro_area_to_send} для поля ID {field_id} при патчі (щоб уникнути 422)")
+                description = f"Ремонт/синхронізація: {work_name}{build_area_display_suffix(raw_area, unit_label, area_is_manual=area_is_manual, field_id=field_id, resolved_area=agro_area_to_send)}"
 
-                if area_is_valid and field_id:
-                    tillable_area = get_field_tillable_area(field_id)
-                    if tillable_area is not None and tillable_area > 0 and raw_area > tillable_area:
-                        logger.info(f"Обрізано площу {raw_area} -> {tillable_area} для поля ID {field_id} при патчі (щоб уникнути 422)")
-                        agro_area_to_send = tillable_area
+                # Якщо рядок є часовим (unit_type == time), не передаємо годин як площу.
 
                 task_ok = patch_machine_task(
                     mt_id,
@@ -2050,10 +2089,11 @@ def run_mode_repair(session, non_interactive=False):
 
                 work_name = v.get('work')
                 unit_label = (v.get('unit_val') or 'од.').strip()
-                description = f"Ремонт/синхронізація: {work_name} (фактично виконано {send_amount:g} {unit_label})"
                 area_is_manual = is_manually_defined_area(v)
+                resolved_send_amount = resolve_effective_area(field_id, send_amount) if field_id else send_amount
+                description = f"Ремонт/синхронізація: {work_name}{build_area_display_suffix(send_amount, unit_label, area_is_manual=area_is_manual, field_id=field_id, resolved_area=resolved_send_amount)}"
                 mt_id, agro_id, field_mapping_item_id, field_linked, agro_linked = send_to_cropwise(
-                    driver_id, machine_id, None, field_id, iso_start, iso_end, season_year, send_amount, work_name, description, area_is_manual=area_is_manual
+                    driver_id, machine_id, None, field_id, iso_start, iso_end, season_year, resolved_send_amount, work_name, description, area_is_manual=area_is_manual
                 )
                 if mt_id:
                     v['status'] = 'sent'
@@ -2357,17 +2397,20 @@ def ask_fuel_column(df, non_interactive=False):
 def run_mode_fuel_update(session, non_interactive=False):
     session_month, session_year = session["month"], session["year"]
 
-    raw_excel = input("\n📂 Шлях до Excel-файлу з даними по пальному: ")
-    excel_file = clean_file_path(raw_excel)
-    if not os.path.exists(excel_file):
-        print("❌ Excel-файл не знайдено!")
+    excel_file, log_path = resolve_fuel_update_paths(
+        session,
+        generate_log_path_for_excel,
+        clean_file_path,
+        non_interactive=non_interactive,
+        input_func=input,
+        print_func=print,
+        exists_func=os.path.exists,
+    )
+    if not excel_file or not log_path:
         return
 
-    raw_log = input("📂 Шлях до існуючого JSON-логу (з Режиму 1): ")
-    log_path = clean_file_path(raw_log)
-    if not os.path.exists(log_path):
-        print("❌ Файл логу не знайдено!")
-        return
+    session["last_excel_file"] = excel_file
+    session["last_log_path"] = log_path
 
     log_data = load_log(log_path)
     if not log_data:
@@ -2636,11 +2679,20 @@ def run_mode_fuel_write_off(session, non_interactive=False):
     print("📦 РЕЖИМ 3: АВТОМАТИЧНЕ СПИСАННЯ ПАЛЬНОГО ЗІ СКЛАДУ")
     print("=" * 70)
 
-    raw_log = input("📂 Шлях до існуючого JSON-логу: ")
-    log_path = clean_file_path(raw_log)
-    if not os.path.exists(log_path):
-        print("❌ Файл логу не знайдено!")
+    excel_file, log_path = resolve_fuel_update_paths(
+        session,
+        generate_log_path_for_excel,
+        clean_file_path,
+        non_interactive=non_interactive,
+        input_func=input,
+        print_func=print,
+        exists_func=os.path.exists,
+    )
+    if not excel_file or not log_path:
         return
+
+    session["last_excel_file"] = excel_file
+    session["last_log_path"] = log_path
 
     log_data = load_log(log_path)
     if not log_data:
@@ -2806,8 +2858,9 @@ def print_final_report_mode3(log_path, stats, report_rows):
 # =====================================================
 def main():
     print("=" * 70)
-    print("🚀 CROPWISE АВТОПІЛОТ — Версія v10.2 (Імпорт + Пальне + Списання)")
+    print("🚀 CROPWISE АВТОПІЛОТ — Версія v11 Імпорт + Пальне + Списання,автоцикл")
     print("   ПС: для пакетної відправки з логу без Excel запустіть з --sync-log <logfile>.")
+    print("   ✨ v11: тепер у Режимі 2 скрипт сам підтягує Excel і лог, якщо вони вже були в роботі.")
     print("=" * 70)
 
     global MANUAL_AREA_INPUT
