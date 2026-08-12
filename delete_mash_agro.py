@@ -1,7 +1,76 @@
 import json
 import os
 import sys
-from cropwise_common import API_BASE, get_headers, api_request, clean_file_path
+import time
+import requests
+
+# =====================================================
+# КОНФІГУРАЦІЯ (той самий підхід до токена, що й в основному скрипті —
+# може використовувати той самий config.json, якщо покласти цей файл поруч)
+# =====================================================
+API_BASE = "https://operations.cropwise.com"
+
+def load_cropwise_token():
+    env_token = os.environ.get("CROPWISE_TOKEN")
+    if env_token:
+        return env_token.strip()
+
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("cropwise_token"):
+                return str(cfg["cropwise_token"]).strip()
+        except Exception:
+            pass
+
+    print("⚠️  Токен не знайдено ні в змінній середовища CROPWISE_TOKEN, ні в config.json поруч зі скриптом.")
+    print("   (Покладіть цей файл в ту саму папку, що й основний скрипт agro1mash — тоді config.json підхопиться сам.)")
+    return input("🔑 Введіть API-токен Cropwise вручну: ").strip()
+
+CROPWISE_TOKEN = load_cropwise_token()
+
+def get_headers():
+    return {
+        "X-User-API-Token": str(CROPWISE_TOKEN).strip(),
+        "Accept": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
+def api_request(method, url, max_retries=3, **kwargs):
+    """Обгортка з обробкою 429 (Too Many Requests) та мережевих збоїв — так само, як в основному скрипті."""
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < max_retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+        if resp.status_code == 429 and attempt < max_retries:
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                wait_s = float(retry_after) if retry_after else 2.0 * (attempt + 1)
+            except (TypeError, ValueError):
+                wait_s = 2.0 * (attempt + 1)
+            print(f"  ⏳ Сервер повернув 429, пауза {wait_s:.1f} с...")
+            time.sleep(wait_s)
+            continue
+        return resp
+    if last_exc:
+        raise last_exc
+    return resp
+
+def clean_file_path(path_str):
+    """Очищає шлях, введений через drag-and-drop, від лапок/амперсанда/пробілів."""
+    if path_str is None:
+        return ""
+    cleaned = str(path_str).strip().lstrip("&").strip()
+    cleaned = cleaned.strip('"').strip("'").strip()
+    return cleaned
 
 # =====================================================
 # ВИДАЛЕННЯ
@@ -36,18 +105,22 @@ def delete_agro_operation(agro_id, retries=2, retry_delay=1.5):
 
     return False, last_err
 
-def get_agro_operation_id_for_task(machine_task_id):
-    """Шукає ID AgroOperation, пов'язаної з конкретним MachineTask, через мапінг-таблицю."""
+def get_agro_operation_ids_for_task(machine_task_id):
+    """
+    Шукає ID УСІХ AgroOperation, пов'язаних із конкретним MachineTask, через мапінг-таблицю.
+    ВАЖЛИВО: одне завдання машини може мати КІЛЬКА пов'язаних агроопераций (напр. коли поля
+    вводились вручну по одному) — раніше ця функція повертала лише items[0], тому видалялась
+    тільки одна з кількох.
+    """
     try:
         resp = api_request("GET", f"{API_BASE}/api/v3/machine_task_agro_operation_mapping_items",
-                            headers=get_headers(), params={"machine_task_id": machine_task_id, "limit": 5}, timeout=10)
+                            headers=get_headers(), params={"machine_task_id": machine_task_id, "limit": 100}, timeout=10)
         if resp.status_code == 200:
             items = resp.json().get("data", [])
-            if items:
-                return items[0].get("agro_operation_id")
-        return None
+            return [item.get("agro_operation_id") for item in items if item.get("agro_operation_id")]
+        return []
     except Exception:
-        return None
+        return []
 
 def load_log(log_path):
     with open(log_path, "r", encoding="utf-8") as f:
@@ -84,12 +157,32 @@ def mode_delete_by_log():
         print("⚠️  У лозі немає жодного запису з machine_task_id/agro_operation_id.")
         return
 
-    print(f"\n📋 Знайдено {len(items)} запис(ів) у лозі, які можна видалити з Cropwise:")
-    for _, entry, mt_id, ao_id in items:
-        work = str(entry.get("work", "?"))[:40]
-        print(f"  • {entry.get('date','?'):<12} | {work:<40} | MT-{mt_id} | AO-{ao_id}")
+    # Лог зберігає лише ОДИН agro_operation_id на завдання, але на сервері до того самого
+    # MachineTask могло прив'язатись кілька агроопераций (напр. поля вводились вручну по
+    # одному) — тому додатково опитуємо сервер за кожним завданням, щоб не пропустити зайві.
+    print("\n🔎 Перевіряю сервер на додаткові агрооперації, не відображені в лозі...")
+    enriched_items = []
+    for key, entry, mt_id, ao_id in items:
+        all_ao_ids = set()
+        if ao_id:
+            all_ao_ids.add(ao_id)
+        if mt_id:
+            server_ao_ids = get_agro_operation_ids_for_task(mt_id)
+            extra = set(server_ao_ids) - all_ao_ids
+            if extra:
+                print(f"  • MT-{mt_id}: у лозі AO-{ao_id}, на сервері ще знайдено {', '.join(f'AO-{a}' for a in extra)}")
+            all_ao_ids.update(server_ao_ids)
+        enriched_items.append((key, entry, mt_id, sorted(all_ao_ids)))
+    items = enriched_items
 
-    print(f"\n⚠️  УВАГА: це НЕЗВОРОТНО видалить {len(items)} завдань машин та пов'язаних агроопераций з Cropwise!")
+    total_ao = sum(len(ao_list) for _, _, _, ao_list in items)
+    print(f"\n📋 Знайдено {len(items)} запис(ів) у лозі, які можна видалити з Cropwise ({total_ao} агроопераций сумарно):")
+    for _, entry, mt_id, ao_list in items:
+        work = str(entry.get("work", "?"))[:40]
+        ao_str = ", ".join(f"AO-{a}" for a in ao_list) if ao_list else "—"
+        print(f"  • {entry.get('date','?'):<12} | {work:<40} | MT-{mt_id} | {ao_str}")
+
+    print(f"\n⚠️  УВАГА: це НЕЗВОРОТНО видалить {len(items)} завдань машин та {total_ao} пов'язаних агроопераций з Cropwise!")
     confirm = input("Введіть 'ВИДАЛИТИ' (великими літерами), щоб підтвердити: ").strip()
     if confirm != "ВИДАЛИТИ":
         print("Скасовано.")
@@ -112,21 +205,22 @@ def mode_delete_by_log():
             print(f"  ❌ Не вдалося видалити MachineTask MT-{mt_id}: {err}")
             stats["mt_error"] += 1
 
-    # Прохід 2: тепер, коли завдання вже видалені, видаляємо агрооперації
+    # Прохід 2: тепер, коли завдання вже видалені, видаляємо УСІ пов'язані агрооперації
     # (delete_agro_operation додатково сама повторює спробу з паузою про всяк випадок)
     print("\n🔻 Крок 2/2: видаляю агрооперації (AgroOperation)...")
-    for _, entry, _, ao_id in items:
+    for _, entry, _, ao_list in items:
         label = f"{entry.get('date','?')} | {str(entry.get('work','?'))[:40]}"
-        if not ao_id:
+        if not ao_list:
             stats["ao_skipped"] += 1
             continue
-        ok2, err2 = delete_agro_operation(ao_id)
-        if ok2:
-            print(f"  ✅ Видалено AgroOperation AO-{ao_id} ({label})")
-            stats["ao_deleted"] += 1
-        else:
-            print(f"  ❌ Не вдалося видалити AgroOperation AO-{ao_id}: {err2}")
-            stats["ao_error"] += 1
+        for ao_id in ao_list:
+            ok2, err2 = delete_agro_operation(ao_id)
+            if ok2:
+                print(f"  ✅ Видалено AgroOperation AO-{ao_id} ({label})")
+                stats["ao_deleted"] += 1
+            else:
+                print(f"  ❌ Не вдалося видалити AgroOperation AO-{ao_id}: {err2}")
+                stats["ao_error"] += 1
 
     print("\n" + "=" * 70)
     print("📊 ПІДСУМОК ВИДАЛЕННЯ:")
@@ -191,10 +285,13 @@ def mode_delete_manual():
         print("\n🔎 Шукаю прив'язані агрооперації для вказаних завдань машин...")
         discovered_ao_ids = []
         for mt_id in mt_ids:
-            found_ao = get_agro_operation_id_for_task(mt_id)
-            if found_ao:
-                discovered_ao_ids.append(found_ao)
-                print(f"  • MT-{mt_id} → знайдено AO-{found_ao}")
+            found_aos = get_agro_operation_ids_for_task(mt_id)
+            if found_aos:
+                discovered_ao_ids.extend(found_aos)
+                if len(found_aos) == 1:
+                    print(f"  • MT-{mt_id} → знайдено AO-{found_aos[0]}")
+                else:
+                    print(f"  • MT-{mt_id} → знайдено {len(found_aos)} агроопераций: {', '.join(f'AO-{a}' for a in found_aos)}")
             else:
                 print(f"  • MT-{mt_id} → агрооперацію не знайдено (можливо, її немає або вже видалена)")
         ao_ids = sorted(set(ao_ids) | set(discovered_ao_ids))
@@ -249,4 +346,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
