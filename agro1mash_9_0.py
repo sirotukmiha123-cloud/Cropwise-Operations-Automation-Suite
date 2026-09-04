@@ -2,7 +2,13 @@ import json
 import os
 import re
 import shutil
-import pandas as pd
+try:
+    import pandas as pd
+except Exception as e:
+    raise ImportError(
+        "The 'pandas' library is required but could not be imported. "
+        "Install it with: pip install pandas"
+    ) from e
 import requests
 import time
 import sys
@@ -12,9 +18,21 @@ from logging.handlers import RotatingFileHandler
 from agro1mash_path_helpers import resolve_fuel_update_paths
 
 try:
-    from openpyxl.utils import column_index_from_string
+    # Prefer explicit import if openpyxl is available.
+    from openpyxl.utils import column_index_from_string  # type: ignore
 except Exception:
-    column_index_from_string = None
+    # Fallback implementation if openpyxl is not available.
+    # Converts Excel column letters (e.g., 'A', 'AA') to 1-based index.
+    def column_index_from_string(col_str):
+        if not isinstance(col_str, str) or not col_str:
+            raise ValueError("Invalid column string")
+        col_str = col_str.upper().strip()
+        if not re.match(r'^[A-Z]+$', col_str):
+            raise ValueError("Invalid column string")
+        idx = 0
+        for ch in col_str:
+            idx = idx * 26 + (ord(ch) - ord('A') + 1)
+        return idx
 
 try:
     import colorama
@@ -195,6 +213,7 @@ def show_loading_animation(endpoint_path, duration=0.4):
         time.sleep(duration / len(frames))
     sys.stdout.write("\r" + " " * 60 + "\r")
     sys.stdout.flush()
+
 
 def draw_progress_bar(current, total, width=20):
     if total <= 0: return "[░░░░░░░░░░░░░░░░░░░░] 0%"
@@ -414,16 +433,62 @@ def find_matching_field(query_str, fields_data):
         return None
     return next((f for f in fields_data if query_norm in normalize_for_fuzzy_match(f.get("name") or f.get("title", ""))), None)
 
-def row_key(date_val, work_name, field_short, excel_row_num):
+def row_key(date_val, work_name, excel_row_num):
     """
     Унікальний ключ рядка логу.
     ВАЖЛИВО: свідомо НЕ включає обсяг роботи (площу/години) — це значення може динамічно
-    підмінюватись під час імпорту (напр. заглушка 0.1 га для нерозпізнаного поля), через що
-    ключі в Режимі 1 (створення) і Режимі 2 (пальне) могли б розійтися. Натомість
-    використовується номер фізичного рядка в Excel-файлі — він стабільний, доки Режим 2
-    запускається на тому самому (чи структурно ідентичному) файлі, що й Режим 1.
+    підмінюватись під час імпорту (напр. заглушка 0.1 га для нерозпізнаного поля).
+    Раніше ключ також включав коротку назву поля (field_short), але це виявилось
+    НЕСТАБІЛЬНИМ: та сама фізична строчка Excel могла давати різний field_short залежно
+    від режиму запуску (напр. Режим 4 РЕМОНТ міг не мати доступу до колонки поля),
+    через що один рядок отримував ДВА різні ключі в лозі — і Режим 2 (пальне) не знаходив
+    правильний запис із machine_task_id. Номер фізичного рядка в Excel-файлі вже сам
+    по собі унікальний в межах файлу, тому field_short для унікальності не потрібен.
     """
-    return f"{date_val}|{work_name}|{field_short}|row{excel_row_num}"
+    return f"{date_val}|{work_name}|row{excel_row_num}"
+
+def find_log_entry_for_row(log_data, date_val, work_name, excel_row_num, actual_work_amount=None):
+    """
+    Стійкий пошук запису логу для рядка Excel. Пробує кілька стратегій по черзі,
+    щоб пережити зміни формату ключа між версіями скрипта:
+      1. Новий формат (без field_short): date|work|rowN
+      2. Старий формат v8 (з field_short, будь-яким): date|work|*|rowN —
+         якщо знайдено кілька — обирається запис зі статусом 'sent' і заповненим
+         machine_task_id (а не порожня заглушка з Режиму 4/РЕМОНТ).
+      3. Найдавніший формат v7: date|work|field_short|обсяг_роботи
+    Повертає (matched_key, entry) або (None, None).
+    """
+    # 1. Новий короткий формат
+    new_key = row_key(date_val, work_name, excel_row_num)
+    if new_key in log_data:
+        return new_key, log_data[new_key]
+
+    # 2. Старий формат з будь-яким field_short — шукаємо всі кандидати за префіксом+суфіксом
+    row_suffix = f"|row{excel_row_num}"
+    prefix = f"{date_val}|{work_name}|"
+    candidates = [
+        (k, v) for k, v in log_data.items()
+        if k.startswith(prefix) and k.endswith(row_suffix)
+    ]
+    if candidates:
+        # Пріоритет: статус 'sent' з реальним machine_task_id
+        sent_with_id = [(k, v) for k, v in candidates if v.get("status") == "sent" and v.get("machine_task_id")]
+        if sent_with_id:
+            # Якщо їх декілька - беремо найновіший за sent_at
+            sent_with_id.sort(key=lambda kv: kv[1].get("sent_at", ""), reverse=True)
+            return sent_with_id[0]
+        # Інакше повертаємо будь-який знайдений (навіть якщо це заглушка) —
+        # виклик коду сам розбереться, що machine_task_id відсутній.
+        return candidates[0]
+
+    # 3. Дуже старий формат v7 (з обсягом роботи замість номера рядка)
+    if actual_work_amount is not None:
+        field_short_guess = clean_field_name_for_key("")  # "не_вказано" за замовчуванням
+        old_key = f"{date_val}|{work_name}|{field_short_guess}|{float(actual_work_amount)}"
+        if old_key in log_data:
+            return old_key, log_data[old_key]
+
+    return None, None
 
 def load_log(log_path):
     if os.path.exists(log_path):
@@ -792,7 +857,7 @@ def extract_row_essentials(row, session_month, session_year, excel_row_num):
         area_source = 'unknown'
 
     field_short = clean_field_name_for_key(field_num_xl)
-    key = row_key(date_val, work_name, field_short, excel_row_num)
+    key = row_key(date_val, work_name, excel_row_num)
 
     return {
         "key": key,
@@ -951,7 +1016,6 @@ def resolve_effective_area(field_id, raw_area):
         return tillable_area
     return value
 
-
 def build_area_display_suffix(actual_area, unit_label, area_is_manual=False, field_id=None, resolved_area=None):
     if actual_area is None:
         return ""
@@ -964,7 +1028,7 @@ def build_area_display_suffix(actual_area, unit_label, area_is_manual=False, fie
     if area_is_manual:
         return f" (площа вказана вручну: {actual_value:g} {unit_label})"
     if resolved_area is not None and field_id and resolved_area < actual_value:
-        return f" (обмежено до {resolved_area:g} {unit_label})"
+        return f" (фактично виконано: {actual_value:g} {unit_label}; обмежено до {resolved_area:g} {unit_label})"
     return f" (фактично виконано: {actual_value:g} {unit_label})"
 
 
@@ -1298,6 +1362,89 @@ def patch_fuel_used(machine_task_id, fuel_liters, field_id=None, field_mapping_i
 # =====================================================
 # ІНІЦІАЛІЗАЦІЯ СЕСІЇ (спільна для обох режимів)
 # =====================================================
+def select_from_list_interactive(items, display_fn, label, allow_exit=True):
+    """
+    Інтерактивний вибір зі списку з активним пошуком:
+    - Вводиш номер зі списку → одразу вибір.
+    - Вводиш текст → список звужується до збігів і перенумеровується;
+      далі вводиш номер уже з відфільтрованого списку (або новий текст щоб звузити ще).
+    - '0' або Enter при звуженому списку → повернення до повного списку.
+    - 'вихід' / 'exit' / 'quit' → завершення програми.
+    Повертає обраний елемент.
+    """
+    current_view = list(items)   # поточний (можливо звужений) список, що показуємо
+    is_filtered = False
+
+    def print_list(view):
+        for i, x in enumerate(view):
+            print(f"  {i+1:>3}. {display_fn(x)}")
+
+    print(f"\n{label}:")
+    print_list(current_view)
+
+    while True:
+        prompt = "  Номер, або текст для пошуку" + (" ('0' — повний список)" if is_filtered else "") + ": "
+        try:
+            ch = input(prompt).strip()
+        except EOFError:
+            print("\n❌ Не вдалося прочитати ввід (EOF). Схоже, скрипт запущено не в звичайному "
+                  "інтерактивному терміналі (наприклад, через подвійний клік на .bat, або з "
+                  "перенаправленим вводом). Запустіть через вже відкритий cmd/PowerShell: "
+                  "python agro1mash_8_0.py")
+            sys.exit(1)
+
+        try:
+            if allow_exit and ch.lower() in ("вихід", "exit", "quit"):
+                print("👋 Роботу перервано користувачем.")
+                sys.exit(0)
+
+            if is_filtered and ch == "0":
+                current_view = list(items)
+                is_filtered = False
+                print(f"\n{label} (повний список):")
+                print_list(current_view)
+                continue
+
+            if ch.isdigit():
+                n = int(ch)
+                if 1 <= n <= len(current_view):
+                    chosen = current_view[n - 1]
+                    print(f"  ✅ Обрано: {display_fn(chosen)}")
+                    return chosen
+                # Число поза межами списку — не обов'язково помилка, можливо це
+                # частина назви/номера техніки (напр. "904" в "YTO NLX 904").
+                # Падаємо в текстовий пошук замість негайної відмови.
+
+            if not ch:
+                print("  ⚠️  Введіть номер або текст для пошуку.")
+                continue
+
+            # Текстовий пошук — звужуємо ПОТОЧНИЙ вигляд (дозволяє уточнювати пошук далі)
+            matches = [x for x in current_view if ch.lower() in display_fn(x).lower()]
+            if not matches:
+                # якщо звужений пошук нічого не дав — пробуємо повний список наново
+                matches = [x for x in items if ch.lower() in display_fn(x).lower()]
+            if len(matches) == 1:
+                print(f"  ✅ Знайдено і обрано: {display_fn(matches[0])}")
+                return matches[0]
+            elif len(matches) > 1:
+                current_view = matches
+                is_filtered = True
+                print(f"\n  🔍 Знайдено {len(matches)} збігів за '{ch}':")
+                print_list(current_view)
+            elif ch.isdigit():
+                print(f"  ⚠️  Немає номера {ch}, і жодного збігу з текстом '{ch}' теж не знайдено. "
+                      f"Введіть число від 1 до {len(current_view)} або частину назви.")
+            else:
+                print(f"  ⚠️  Нічого не знайдено за '{ch}'. Спробуйте ще раз.")
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"  ❌ Несподівана помилка вибору: {type(e).__name__}: {e}")
+            print("  Спробуйте ще раз, або повідомте цей текст помилки.")
+            continue
+
+
 def init_session():
     if not drivers_data:
         print(f"{C_ERR}❌ Довідник водіїв порожній: не вдалося завантажити дані ні з сервера, ні з кешу "
@@ -1318,43 +1465,8 @@ def init_session():
             break
         print("  ⚠️  Невірний формат.")
 
-    print("\n👨 ВОДІЇ:")
-    for i, d in enumerate(drivers_data): print(f"  {i+1:>3}. {get_driver_name(d)}")
-    while True:
-        ch = input("  Номер водія (або частина прізвища, 'вихід' для виходу): ").strip()
-        if ch.lower() in ("вихід", "exit", "quit"):
-            print("👋 Роботу перервано користувачем.")
-            sys.exit(0)
-        if ch.isdigit() and 1 <= int(ch) <= len(drivers_data):
-            selected_driver = drivers_data[int(ch) - 1]
-            break
-        matches = [d for d in drivers_data if ch.lower() in get_driver_name(d).lower()]
-        if len(matches) == 1:
-            selected_driver = matches[0]
-            break
-        elif len(matches) > 1:
-            print("  Знайдено декілька збігів, уточніть номер зі списку вище.")
-        else:
-            print("  ⚠️  Не знайдено. Спробуйте ще раз.")
-
-    print("\n🚜 ТЕХНІКА:")
-    for i, m in enumerate(machines_data): print(f"  {i+1:>3}. {get_machine_name(m)}")
-    while True:
-        ch = input("  Номер машини (або частина назви, 'вихід' для виходу): ").strip()
-        if ch.lower() in ("вихід", "exit", "quit"):
-            print("👋 Роботу перервано користувачем.")
-            sys.exit(0)
-        if ch.isdigit() and 1 <= int(ch) <= len(machines_data):
-            selected_machine = machines_data[int(ch) - 1]
-            break
-        matches = [m for m in machines_data if ch.lower() in get_machine_name(m).lower()]
-        if len(matches) == 1:
-            selected_machine = matches[0]
-            break
-        elif len(matches) > 1:
-            print("  Знайдено декілька збігів, уточніть номер зі списку вище.")
-        else:
-            print("  ⚠️  Не знайдено. Спробуйте ще раз.")
+    selected_driver = select_from_list_interactive(drivers_data, get_driver_name, "👨 ВОДІЇ")
+    selected_machine = select_from_list_interactive(machines_data, get_machine_name, "🚜 ТЕХНІКА")
 
     driver_id, machine_id = selected_driver.get("id"), selected_machine.get("id")
     driver_name_str, machine_name_str = get_driver_name(selected_driver), get_machine_name(selected_machine)
@@ -1372,6 +1484,7 @@ def init_session():
 # РЕЖИМ 1: ПЕРВИННИЙ ІМПОРТ РОБІТ + СТВОРЕННЯ ЛОГУ
 # =====================================================
 def run_mode_primary_import(session, non_interactive=False):
+    mode1_start_time = time.time()
 
     session_month, session_year = session["month"], session["year"]
     driver_id, machine_id = session["driver_id"], session["machine_id"]
@@ -1428,6 +1541,15 @@ def run_mode_primary_import(session, non_interactive=False):
 
         essentials = extract_row_essentials(row, session_month, session_year, excel_row_num)
         r_key = essentials["key"]
+        # Стійкий пошук: якщо рядок вже є в лозі під СТАРИМ форматом ключа
+        # (з field_short, до фіксу), знаходимо саме його — інакше перевірка
+        # на дублікат нижче не спрацює і скрипт повторно надішле на сервер.
+        matched_key, _existing_probe = find_log_entry_for_row(
+            log_data, essentials["date_val"], essentials["work_name"],
+            excel_row_num, essentials["actual_work_amount"]
+        )
+        if matched_key is None:
+            matched_key = r_key
         date_val = essentials["date_val"]
         end_date_val = essentials["end_date_val"]
         work_name = essentials["work_name"]
@@ -1462,10 +1584,10 @@ def run_mode_primary_import(session, non_interactive=False):
             # того самого дня рахувався коректно, навіть якщо сумарно вони переходять за північ.
             day_time_memory[date_val] = end_total_min
 
-        if log_data.get(r_key, {}).get("status") == "sent":
+        if log_data.get(matched_key, {}).get("status") == "sent":
             stats["skipped"] += 1
-            saved_mt = log_data[r_key].get("machine_task_id", "ПРОПУЩЕНО")
-            saved_ao = log_data[r_key].get("agro_operation_id", "ПРОПУЩЕНО")
+            saved_mt = log_data[matched_key].get("machine_task_id", "ПРОПУЩЕНО")
+            saved_ao = log_data[matched_key].get("agro_operation_id", "ПРОПУЩЕНО")
             final_registry.append([work_row_counter, work_name, f"MT-{saved_mt}", f"AO-{saved_ao}" if saved_ao else "-", time_formatted, f"{actual_work_amount} {unit_val}", "Пропущено (Дубль)"])
             continue
 
@@ -1600,7 +1722,7 @@ def run_mode_primary_import(session, non_interactive=False):
             field_linked = False
             agro_linked = False
             # Записуємо локальну інформацію відразу (не створюємо статус 'sent')
-            log_data[r_key] = {
+            log_data[matched_key] = {
                 "status": "local",
                 "machine_task_id": None,
                 "agro_operation_id": None,
@@ -1626,7 +1748,7 @@ def run_mode_primary_import(session, non_interactive=False):
             continue
 
         if mt_id:
-            log_data[r_key] = {
+            log_data[matched_key] = {
                 "status": "sent",
                 "machine_task_id": mt_id,
                 "agro_operation_id": agro_id,
@@ -1676,9 +1798,9 @@ def run_mode_primary_import(session, non_interactive=False):
             stats["error"] += 1
             final_registry.append([work_row_counter, work_name, "ПОМИЛКА", "ПОМИЛКА", time_formatted, f"{actual_work_amount} {unit_val}", "❌ Відхилено сервером"])
 
-    print_final_report_mode1(driver_name_str, machine_name_str, session_month, session_year, log_path, stats, final_registry)
+    print_final_report_mode1(driver_name_str, machine_name_str, session_month, session_year, log_path, stats, final_registry, mode1_start_time)
 
-def print_final_report_mode1(driver_name_str, machine_name_str, session_month, session_year, log_path, stats, final_registry):
+def print_final_report_mode1(driver_name_str, machine_name_str, session_month, session_year, log_path, stats, final_registry, mode1_start_time=None):
     report_lines = []
     report_lines.append("\n" + "=" * 105)
     report_lines.append("🏁 ОБРОБКА ОБЛІКОВОГО ЛИСТА ЗАВЕРШЕНА! (Режим 1: Первинний імпорт)")
@@ -1696,6 +1818,9 @@ def print_final_report_mode1(driver_name_str, machine_name_str, session_month, s
     report_lines.append(f"  ⏭️  Пропущено дублів:      {stats['skipped']} рядк.")
     report_lines.append(f"  ❌ Помилки відправки:      {stats['error']} рядк.")
     report_lines.append(f"  ⏱️  Загальний облікований час за сесію: {stats['total_hours']} год.")
+    if mode1_start_time is not None:
+        real_elapsed = time.time() - mode1_start_time
+        report_lines.append(f"  🕐 Реальний час роботи скрипта в цьому режимі: {format_duration(real_elapsed)}")
     report_lines.append("=" * 105)
     report_lines.append("Далі: коли отримаєте дані про пальне, запустіть Режим 2 і вкажіть цей самий файл логу. ⛽")
     report_lines.append("=" * 105)
@@ -1717,6 +1842,7 @@ def print_final_report_mode1(driver_name_str, machine_name_str, session_month, s
 #    показує фінальний звіт, пропонує замінити лог, а потім — надіслати відсутні записи на сервер.
 # =====================================================
 def run_mode_repair(session, non_interactive=False):
+    mode4_start_time = time.time()
     session_month, session_year = session["month"], session["year"]
     driver_id, machine_id = session["driver_id"], session["machine_id"]
 
@@ -1817,7 +1943,12 @@ def run_mode_repair(session, non_interactive=False):
             iso_start = None
             iso_end = None
 
-        existing = log_data.get(r_key, {})
+        matched_key, existing = find_log_entry_for_row(
+            log_data, essentials['date_val'], essentials['work_name'], excel_row_num, actual_work_amount
+        )
+        if matched_key is None:
+            matched_key = r_key
+            existing = {}
         if existing.get('status') == 'sent':
             patched = False
             if existing.get('actual_area') != actual_work_amount:
@@ -1859,11 +1990,11 @@ def run_mode_repair(session, non_interactive=False):
                 existing['manual_area_source'] = 'repair'
                 existing['area_source'] = 'repair'
                 existing['manual_area_value'] = actual_work_amount
-                log_data[r_key] = existing
+                log_data[matched_key] = existing
                 save_log(log_file, log_data)
                 updated += 1
                 patched_sent_entries.append({
-                    'key': r_key,
+                    'key': matched_key,
                     'entry': existing,
                     'field_id': field_id,
                     'field_name': field_name,
@@ -1884,11 +2015,11 @@ def run_mode_repair(session, non_interactive=False):
                 existing['manual_area_source'] = 'repair'
                 existing['area_source'] = 'repair'
                 existing['manual_area_value'] = actual_work_amount
-                log_data[r_key] = existing
+                log_data[matched_key] = existing
                 save_log(log_file, log_data)
                 updated += 1
                 patched_sent_entries.append({
-                    'key': r_key,
+                    'key': matched_key,
                     'entry': existing,
                     'field_id': field_id,
                     'field_name': field_name,
@@ -1937,6 +2068,7 @@ def run_mode_repair(session, non_interactive=False):
     # Показуємо фінальний звіт (короткий)
     print('\n=== Фінальний звіт синхронізації ===')
     print(f'Оновлено записів: {updated}, Пропущено (вже відправлені): {skipped}, Помилок: {errors}')
+    print(f'🕐 Реальний час роботи скрипта в цьому режимі: {format_duration(time.time() - mode4_start_time)}')
     if updated == 0 and skipped == len(valid_rows) and errors == 0:
         print('⚠️ Усі знайдені записи вже мали актуальні дані. Нічого не змінено.')
 
@@ -2395,6 +2527,7 @@ def ask_fuel_column(df, non_interactive=False):
         print("   ⚠️  Невірний формат, спробуйте ще раз (наприклад: V або 21).")
 
 def run_mode_fuel_update(session, non_interactive=False):
+    mode2_start_time = time.time()
     session_month, session_year = session["month"], session["year"]
 
     excel_file, log_path = resolve_fuel_update_paths(
@@ -2463,17 +2596,11 @@ def run_mode_fuel_update(session, non_interactive=False):
             report_rows.append([excel_row_num, work_name, date_val, str(fuel_raw), "❌ Невірний формат пального"])
             continue
 
-        # 1. Спроба знайти за новим стандартом v8 (ключ з '...|rowN' в кінці)
-        matched_key = r_key
-        log_entry = log_data.get(matched_key)
-
-        # 2. Якщо не знайдено — пробуємо старий стандарт v7 (ключ з обсягом роботи в кінці, напр. "...|6.0")
-        if not log_entry:
-            old_key = f"{date_val}|{work_name}|{field_short}|{float(actual_work_amount)}"
-            log_entry = log_data.get(old_key)
-            if log_entry:
-                matched_key = old_key
-                print(f"   ℹ️  [Сумісність] Знайдено за старим форматом v7 для рядка {excel_row_num}")
+        # Стійкий пошук: переживає зміну формату ключа (без field_short) і
+        # задвоєні записи через Режим 4 РЕМОНТ (обирає той, що має machine_task_id)
+        matched_key, log_entry = find_log_entry_for_row(
+            log_data, date_val, work_name, excel_row_num, actual_work_amount
+        )
 
         if not log_entry:
             stats["not_found"] += 1
@@ -2514,9 +2641,9 @@ def run_mode_fuel_update(session, non_interactive=False):
             report_rows.append([excel_row_num, work_name, date_val, fuel_liters, "❌ Сервер відхилив оновлення"])
 
     save_log(log_path, log_data)
-    print_final_report_mode2(log_path, stats, report_rows)
+    print_final_report_mode2(log_path, stats, report_rows, mode2_start_time)
 
-def print_final_report_mode2(log_path, stats, report_rows):
+def print_final_report_mode2(log_path, stats, report_rows, mode2_start_time=None):
     lines = []
     lines.append("\n" + "=" * 100)
     lines.append("🏁 ОНОВЛЕННЯ ПАЛЬНОГО ЗАВЕРШЕНО! (Режим 2)")
@@ -2534,6 +2661,8 @@ def print_final_report_mode2(log_path, stats, report_rows):
     lines.append(f"  ⚠️  Не знайдено в лозі:     {stats['not_found']} рядк.")
     lines.append(f"  ➖ Без значення пального:  {stats['no_fuel_value']} рядк.")
     lines.append(f"  ❌ Помилки:                {stats['error']} рядк.")
+    if mode2_start_time is not None:
+        lines.append(f"  🕐 Реальний час роботи скрипта в цьому режимі: {format_duration(time.time() - mode2_start_time)}")
     lines.append("=" * 100)
 
     for line in lines:
@@ -2675,8 +2804,8 @@ def run_mode_fuel_write_off(session, non_interactive=False):
     Використовує agro_operation_id, вже збережений у лозі Режимом 1, та fuel_used,
     збережений Режимом 2 — обидва режими мають бути виконані заздалегідь для кожного рядка.
     """
+    mode3_start_time = time.time()
     print("\n" + "=" * 70)
-    print("📦 РЕЖИМ 3: АВТОМАТИЧНЕ СПИСАННЯ ПАЛЬНОГО ЗІ СКЛАДУ")
     print("=" * 70)
 
     excel_file, log_path = resolve_fuel_update_paths(
@@ -2764,7 +2893,7 @@ def run_mode_fuel_write_off(session, non_interactive=False):
             stats["errors"] += 1
             report_rows.append([date_raw, work_name, fuel_amount, "❌ Помилка створення документа"])
 
-    print_final_report_mode3(log_path, stats, report_rows)
+    print_final_report_mode3(log_path, stats, report_rows, mode3_start_time)
     mark_session_folder_complete_if_done(log_path, log_data)
 
 def mark_session_folder_complete_if_done(log_path, log_data):
@@ -2824,7 +2953,7 @@ def mark_session_folder_complete_if_done(log_path, log_data):
     except Exception as e2:
         print(f"⚠️  Не вдалося ні перейменувати папку сесії ({last_err}), ні створити маркер-файл ({e2}).")
 
-def print_final_report_mode3(log_path, stats, report_rows):
+def print_final_report_mode3(log_path, stats, report_rows, mode3_start_time=None):
     lines = []
     lines.append("\n" + "=" * 100)
     lines.append("🏁 АВТОМАТИЧНЕ СПИСАННЯ ПАЛЬНОГО ЗАВЕРШЕНО! (Режим 3)")
@@ -2840,6 +2969,8 @@ def print_final_report_mode3(log_path, stats, report_rows):
     lines.append(f"  ✅ Списано успішно:        {stats['written_off']} рядк.")
     lines.append(f"  ⏭️  Вже було списано:      {stats['skipped_already']} рядк.")
     lines.append(f"  ❌ Помилки:                {stats['errors']} рядк.")
+    if mode3_start_time is not None:
+        lines.append(f"  🕐 Реальний час роботи скрипта в цьому режимі: {format_duration(time.time() - mode3_start_time)}")
     lines.append("=" * 100)
 
     for line in lines:
@@ -2856,11 +2987,26 @@ def print_final_report_mode3(log_path, stats, report_rows):
 # =====================================================
 # СТАРТ ПРОГРАМИ
 # =====================================================
+def format_duration(seconds):
+    """Форматує тривалість у людяний вигляд: 'X год Y хв Z сек' (пропускає нульові одиниці)."""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h: parts.append(f"{h} год")
+    if m: parts.append(f"{m} хв")
+    parts.append(f"{s} сек")
+    return " ".join(parts)
+
+
 def main():
+    script_start_time = time.time()
+
     print("=" * 70)
-    print("🚀 CROPWISE АВТОПІЛОТ — Версія v11 Імпорт + Пальне + Списання,автоцикл")
+    print("🚀 CROPWISE АВТОПІЛОТ — Версія v11.9 4r+avtosearch")
     print("   ПС: для пакетної відправки з логу без Excel запустіть з --sync-log <logfile>.")
     print("   ✨ v11: тепер у Режимі 2 скрипт сам підтягує Excel і лог, якщо вони вже були в роботі.")
+    print(f"   🕐 Старт сесії: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     print("=" * 70)
 
     global MANUAL_AREA_INPUT
@@ -2879,6 +3025,8 @@ def main():
 
     if '--sync-log' in sys.argv:
         run_mode_sync_log(session, log_file=SYNC_LOG_PATH, non_interactive=NON_INTERACTIVE)
+        elapsed = time.time() - script_start_time
+        print(f"\n⏱️  Загальний час роботи скрипта: {format_duration(elapsed)}")
         return
 
     while True:
@@ -2892,6 +3040,8 @@ def main():
         print("=" * 70)
         mode = input("👉 Ваш вибір: ").strip()
 
+        mode_start_time = time.time()
+
         if mode == "1":
             run_mode_primary_import(session)
         elif mode == "2":
@@ -2901,13 +3051,23 @@ def main():
         elif mode == "4":
             run_mode_repair(session, non_interactive=NON_INTERACTIVE)
         elif mode == "0":
+            elapsed = time.time() - script_start_time
+            print(f"⏱️  Загальний час роботи скрипта: {format_duration(elapsed)}")
             print("👋 Роботу завершено.")
             break
         else:
             print("⚠️  Невірний вибір, спробуйте ще раз.")
             continue
+
+        mode_elapsed = time.time() - mode_start_time
+        total_elapsed = time.time() - script_start_time
+        print(f"⏱️  Час цієї дії: {format_duration(mode_elapsed)}  |  "
+              f"Загалом за сесію: {format_duration(total_elapsed)}")
+
         again = input("\n🔁 Виконати ще одну дію в цій самій сесії (той самий водій/машина)? (т/н): ").strip().lower()
         if again not in ("т", "так", "y", "yes"):
+            elapsed = time.time() - script_start_time
+            print(f"⏱️  Загальний час роботи скрипта: {format_duration(elapsed)}")
             print("👋 Роботу завершено.")
             break
 
