@@ -29,3 +29,4 @@ venv/
 # ОС
 .DS_Store
 Thumbs.db
+!examples/accounting_sheet.demo.xlsx

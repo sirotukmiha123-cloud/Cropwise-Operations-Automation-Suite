@@ -391,7 +391,7 @@ def clean_file_path(path_str):
 def clean_field_name_for_key(field_full_name):
     """
     Приводить повну назву поля до короткого унікального вигляду для ключа логу.
-    Приклад: "00 Коледж(Іллінці)" -> "коледж"
+    Приклад: "00 Farm (Village)" -> "farm"
     """
     if not field_full_name:
         return "не_вказано"
