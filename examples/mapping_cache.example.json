@@ -1,0 +1,17 @@
+{
+  "example herbicide (5 l canister)": {
+    "id": 101,
+    "name": "Example Herbicide (5 L canister)",
+    "unit_id": 1
+  },
+  "example fungicide (1 kg bag)": {
+    "id": 102,
+    "name": "Example Fungicide (1 kg bag)",
+    "unit_id": 2
+  },
+  "example liquid fertilizer": {
+    "id": 103,
+    "name": "Example Liquid Fertilizer",
+    "unit_id": 1
+  }
+}
